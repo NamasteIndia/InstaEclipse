@@ -11,6 +11,7 @@ import com.google.gson.Gson;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 
 public class VersionCheckUtility {
@@ -55,8 +56,30 @@ public class VersionCheckUtility {
 
     private static void handleVersionCheckResult(Context context, VersionCheck versionCheck) {
         String latestVersion = versionCheck.getLatestVersion();
+        String updateUrl = versionCheck.getUpdateUrl();
+        if (!isValidUpdateTarget(latestVersion, updateUrl)) {
+            showErrorDialog(context);
+            return;
+        }
+
         if (!CURRENT_VERSION.equals(latestVersion)) {
-            showUpdateDialog(context, versionCheck.getUpdateUrl(), latestVersion);
+            showUpdateDialog(context, updateUrl, latestVersion);
+        }
+    }
+
+    static boolean isValidUpdateTarget(String latestVersion, String updateUrl) {
+        if (latestVersion == null || latestVersion.trim().isEmpty()) {
+            return false;
+        }
+        if (updateUrl == null || updateUrl.trim().isEmpty()) {
+            return false;
+        }
+
+        try {
+            String scheme = URI.create(updateUrl).getScheme();
+            return "https".equalsIgnoreCase(scheme);
+        } catch (IllegalArgumentException ignored) {
+            return false;
         }
     }
 

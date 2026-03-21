@@ -254,8 +254,6 @@ public class DialogUtils {
                 clearAppCache(context); // Clear cache first
                 intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
                 context.startActivity(intent);
-                // Forcibly kill the current process to ensure a clean restart
-                Runtime.getRuntime().exit(0);
             } else {
                 Toast.makeText(context, "Could not find the app to restart.", Toast.LENGTH_SHORT).show();
             }

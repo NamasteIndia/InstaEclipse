@@ -14,6 +14,8 @@ public class MediaDownloadUtilsTest {
         assertTrue(MediaDownloadUtils.isSupportedMediaUrl("https://cdninstagram.com/v/test.mp4?x=1"));
         assertFalse(MediaDownloadUtils.isSupportedMediaUrl("http://i.instagram.com/path/abc.jpg"));
         assertFalse(MediaDownloadUtils.isSupportedMediaUrl("https://i.instagram.com/path/abc.json"));
+        assertFalse(MediaDownloadUtils.isSupportedMediaUrl("https://i.instagram.com/path/abc.jpg.html"));
+        assertFalse(MediaDownloadUtils.isSupportedMediaUrl("https://i.instagram.com/path/content?file=abc.jpg"));
     }
 
     @Test
@@ -21,6 +23,7 @@ public class MediaDownloadUtilsTest {
         assertEquals(".mp4", MediaDownloadUtils.fileExtensionForUrl("https://i.instagram.com/a/b.mp4?foo=1"));
         assertEquals(".jpg", MediaDownloadUtils.fileExtensionForUrl("https://i.instagram.com/a/b.jpg"));
         assertEquals(".bin", MediaDownloadUtils.fileExtensionForUrl("https://i.instagram.com/a/b"));
+        assertEquals(".jpg", MediaDownloadUtils.fileExtensionForUrl("https://i.instagram.com/a/video.mp4.jpg"));
     }
 
     @Test

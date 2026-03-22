@@ -30,6 +30,7 @@ import java.net.URL;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.UUID;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -183,7 +184,7 @@ public class MediaDownloadButtonHook {
 
             input = connection.getInputStream();
             String ext = MediaDownloadUtils.fileExtensionForUrl(urlString);
-            String fileName = "InstaEclipse_" + System.currentTimeMillis() + ext;
+            String fileName = "InstaEclipse_" + System.currentTimeMillis() + "_" + UUID.randomUUID() + ext;
             String mimeType = ext.equals(".mp4") ? "video/mp4" : "image/*";
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

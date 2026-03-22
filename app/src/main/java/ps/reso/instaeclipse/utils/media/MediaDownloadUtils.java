@@ -1,31 +1,35 @@
 package ps.reso.instaeclipse.utils.media;
 
+import java.net.URI;
 import java.util.Locale;
+import java.util.Set;
 
 public final class MediaDownloadUtils {
+    private static final Set<String> SUPPORTED_EXTENSIONS = Set.of(".jpg", ".jpeg", ".png", ".webp", ".mp4");
+
     private MediaDownloadUtils() {
     }
 
     public static boolean isSupportedMediaUrl(String url) {
         if (url == null || url.isEmpty()) return false;
-        String lower = url.toLowerCase(Locale.ROOT);
-        if (!lower.startsWith("https://")) return false;
-        return lower.contains(".jpg")
-                || lower.contains(".jpeg")
-                || lower.contains(".png")
-                || lower.contains(".webp")
-                || lower.contains(".mp4");
+        try {
+            URI uri = URI.create(url);
+            if (!"https".equalsIgnoreCase(uri.getScheme())) return false;
+            return SUPPORTED_EXTENSIONS.contains(fileExtensionForPath(uri.getPath()));
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
     }
 
     public static String fileExtensionForUrl(String url) {
-        if (url == null) return ".bin";
-        String lower = url.toLowerCase(Locale.ROOT);
-        if (lower.contains(".mp4")) return ".mp4";
-        if (lower.contains(".jpeg")) return ".jpeg";
-        if (lower.contains(".jpg")) return ".jpg";
-        if (lower.contains(".png")) return ".png";
-        if (lower.contains(".webp")) return ".webp";
-        return ".bin";
+        if (url == null || url.isEmpty()) return ".bin";
+        try {
+            URI uri = URI.create(url);
+            String ext = fileExtensionForPath(uri.getPath());
+            return SUPPORTED_EXTENSIONS.contains(ext) ? ext : ".bin";
+        } catch (IllegalArgumentException e) {
+            return ".bin";
+        }
     }
 
     public static boolean isTrustedInstagramHost(String host) {
@@ -37,5 +41,15 @@ public final class MediaDownloadUtils {
                 || lower.endsWith(".cdninstagram.com")
                 || lower.equals("fbcdn.net")
                 || lower.endsWith(".fbcdn.net");
+    }
+
+    private static String fileExtensionForPath(String path) {
+        if (path == null || path.isEmpty()) return "";
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        int lastSlash = lowerPath.lastIndexOf('/');
+        String fileName = lastSlash >= 0 ? lowerPath.substring(lastSlash + 1) : lowerPath;
+        int dot = fileName.lastIndexOf('.');
+        if (dot < 0 || dot == fileName.length() - 1) return "";
+        return fileName.substring(dot);
     }
 }

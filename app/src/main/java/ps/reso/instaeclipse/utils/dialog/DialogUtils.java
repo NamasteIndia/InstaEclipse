@@ -666,7 +666,7 @@ public class DialogUtils {
                 createSwitch(context, "Disable Repost", FeatureFlags.disableRepost),
                 createSwitch(context, "Show Follower Toast", FeatureFlags.showFollowerToast),
                 createSwitch(context, "Show Feature Toasts", FeatureFlags.showFeatureToasts),
-                createSwitch(context, "Enable Media Download Button", FeatureFlags.enableMediaDownload)
+                createSwitch(context, "Media Download Button", FeatureFlags.enableMediaDownload)
         };
 
         // Create Enable/Disable All switch

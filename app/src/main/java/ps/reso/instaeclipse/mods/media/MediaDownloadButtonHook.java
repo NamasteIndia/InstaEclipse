@@ -2,6 +2,7 @@ package ps.reso.instaeclipse.mods.media;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.AndroidAppHelper;
 import android.content.ContentValues;
 import android.content.Context;
@@ -24,24 +25,29 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.CookieManager;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
-import java.net.URI;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -49,152 +55,93 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 import ps.reso.instaeclipse.utils.feature.FeatureStatusTracker;
-import ps.reso.instaeclipse.utils.media.MediaDownloadUtils;
 
+/**
+ * MediaDownloadButtonHook
+ *
+ * Approach (same as AeroInsta):
+ *  1. Hook the 3-dot menu bottom sheet to inject "Download" and "Download All" rows.
+ *  2. Intercept the media model object that Instagram passes when opening the menu,
+ *     extract the media_id (pk) from it via reflection.
+ *  3. On tap, call https://i.instagram.com/api/v1/media/{media_id}/info/ using the
+ *     session cookies already stored by Instagram's WebView (CookieManager).
+ *  4. Parse JSON:
+ *       Single image  -> items[0].image_versions2.candidates[0].url
+ *       Single video  -> items[0].video_versions[0].url
+ *       Carousel      -> items[0].carousel_media[N].(image|video)
+ *  5. Download each URL with a background thread + MediaStore.
+ */
 public class MediaDownloadButtonHook {
 
-    private static final String SHEET_TAG = "ie_dl_sheet_item";
+    private static final String TAG = "(InstaEclipse | MediaDownload)";
+    private static final String API_BASE = "https://i.instagram.com/api/v1/media/";
+    private static final String SHEET_TAG = "ie_dl_row";
 
-    /**
-     * VIDEO_CACHE: stores full video URLs captured from ExoPlayer.
-     * These are the real stream URLs with audio+video muxed, or the
-     * highest quality video track URL from Instagram's CDN.
-     *
-     * Key insight: Instagram serves videos as a single muxed MP4 via CDN.
-     * The URL captured from ExoPlayer's MediaItem is the direct CDN link
-     * with both audio and video — downloading it directly gives a complete file.
-     *
-     * IMAGE_CACHE: stores image URLs per-post (supports carousel/album).
-     * We collect ALL image URLs seen since the last post open, then
-     * "Download All" downloads each one.
-     */
-    private static final ConcurrentLinkedDeque<String> VIDEO_CACHE = new ConcurrentLinkedDeque<>();
-    private static final ConcurrentLinkedDeque<String> IMAGE_CACHE = new ConcurrentLinkedDeque<>();
-    private static final int CACHE_MAX = 30;
+    // Media type constants (Instagram internal)
+    private static final int TYPE_IMAGE    = 1;
+    private static final int TYPE_VIDEO    = 2;
+    private static final int TYPE_CAROUSEL = 8;
+
+    // Most-recently-seen media object (set when 3-dot menu opens)
+    private static volatile Object sCurrentMediaModel = null;
+    // Most-recently-seen media_id string
+    private static volatile String sCurrentMediaId = null;
+
+    private static final ExecutorService sPool = Executors.newFixedThreadPool(4);
 
     // ─────────────────────────────────────────────────────────────────────────
-    // install() — called from Module.hookInstagram()
+    // install()
     // ─────────────────────────────────────────────────────────────────────────
 
     public void install(XC_LoadPackage.LoadPackageParam lpparam) {
-        hookExoPlayer(lpparam.classLoader);
-        hookTigonImages(lpparam);
+        hookMenuOpening(lpparam.classLoader);
+        FeatureStatusTracker.setHooked("MediaDownload");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // 1. ExoPlayer hook — captures the muxed video URL (audio + video)
+    // Hook: capture media model when user taps the 3-dot menu
     //
-    // Instagram uses ExoPlayer for all video playback (feed, reels, stories).
-    // The MediaItem passed to setMediaItem/addMediaItem contains the direct
-    // CDN URL of the muxed MP4. This is the correct URL for full video+audio.
+    // Instagram sets the media model on the bottom sheet before showing it.
+    // We hook the most likely entry points to capture it.
     // ─────────────────────────────────────────────────────────────────────────
 
-    private void hookExoPlayer(ClassLoader cl) {
-        for (String methodName : new String[]{"setMediaItem", "addMediaItem"}) {
-            try {
-                Class<?> exo = cl.loadClass("com.google.android.exoplayer2.ExoPlayer");
-                Class<?> mi  = cl.loadClass("com.google.android.exoplayer2.MediaItem");
-                XposedHelpers.findAndHookMethod(exo, methodName, mi, new XC_MethodHook() {
+    private void hookMenuOpening(ClassLoader cl) {
+        // Hook View.setTag — Instagram sets the media object as view tag
+        // on action rows before the menu opens. We scan for media-like objects.
+        XposedHelpers.findAndHookMethod(View.class, "setTag", Object.class,
+                new XC_MethodHook() {
                     @Override
-                    protected void beforeHookedMethod(MethodHookParam p) {
+                    protected void afterHookedMethod(MethodHookParam param) {
                         if (!FeatureFlags.enableMediaDownload) return;
-                        String url = extractUrlFromMediaItem(p.args[0]);
-                        if (url != null && MediaDownloadUtils.isTrustedInstagramHost(getHost(url))) {
-                            addToCache(VIDEO_CACHE, url);
-                            FeatureStatusTracker.setHooked("MediaDownload");
-                            XposedBridge.log("(InstaEclipse | MediaDownload): video URL cached: " + url.substring(0, Math.min(80, url.length())));
+                        Object tag = param.args[0];
+                        if (tag == null) return;
+                        String mediaId = extractMediaId(tag);
+                        if (mediaId != null) {
+                            sCurrentMediaModel = tag;
+                            sCurrentMediaId = mediaId;
                         }
                     }
                 });
-            } catch (Throwable ignored) {}
-        }
 
-        // Also hook prepare() on ExoPlayerImpl as a fallback
-        try {
-            Class<?> exoImpl = cl.loadClass("com.google.android.exoplayer2.ExoPlayerImpl");
-            XposedHelpers.findAndHookMethod(exoImpl, "prepare", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam p) {
-                    if (!FeatureFlags.enableMediaDownload) return;
-                    // Extract media source URL via reflection
-                    try {
-                        Object player = p.thisObject;
-                        Field mediaSourceField = findFieldUp(player.getClass(), "mediaSource");
-                        if (mediaSourceField == null) return;
-                        mediaSourceField.setAccessible(true);
-                        Object src = mediaSourceField.get(player);
-                        if (src == null) return;
-                        // Try to get URI from ProgressiveMediaSource or similar
-                        Field uriField = findFieldUp(src.getClass(), "uri");
-                        if (uriField == null) return;
-                        uriField.setAccessible(true);
-                        Object uri = uriField.get(src);
-                        if (uri != null) {
-                            String url = uri.toString();
-                            if (MediaDownloadUtils.isTrustedInstagramHost(getHost(url)))
-                                addToCache(VIDEO_CACHE, url);
+        // Also hook View.setTag(int, Object) for keyed tags
+        XposedHelpers.findAndHookMethod(View.class, "setTag", int.class, Object.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (!FeatureFlags.enableMediaDownload) return;
+                        Object tag = param.args[1];
+                        if (tag == null) return;
+                        String mediaId = extractMediaId(tag);
+                        if (mediaId != null) {
+                            sCurrentMediaModel = tag;
+                            sCurrentMediaId = mediaId;
                         }
-                    } catch (Throwable ignored) {}
-                }
-            });
-        } catch (Throwable ignored) {}
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // 2. Tigon hook — captures image URLs from API responses
-    //
-    // Instagram's image URLs come through the Tigon network layer.
-    // We only cache URLs that look like image CDN links.
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private void hookTigonImages(XC_LoadPackage.LoadPackageParam lpparam) {
-        try {
-            ClassLoader cl = lpparam.classLoader;
-            Class<?> tigonClass = cl.loadClass("com.instagram.api.tigon.TigonServiceLayer");
-            Class<?> param1 = null;
-            String uriFieldName = null;
-
-            for (Method m : tigonClass.getDeclaredMethods()) {
-                if (m.getName().equals("startRequest") && m.getParameterCount() == 3) {
-                    param1 = m.getParameterTypes()[0];
-                    break;
-                }
-            }
-            if (param1 != null) {
-                for (Field f : param1.getDeclaredFields()) {
-                    if (f.getType().equals(URI.class)) {
-                        uriFieldName = f.getName();
-                        break;
                     }
-                }
-            }
-            if (param1 == null || uriFieldName == null) return;
-
-            final String finalField = uriFieldName;
-            XposedBridge.hookAllMethods(tigonClass, "startRequest", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!FeatureFlags.enableMediaDownload) return;
-                    try {
-                        URI uri = (URI) XposedHelpers.getObjectField(param.args[0], finalField);
-                        if (uri == null) return;
-                        String url = uri.toString();
-                        String host = uri.getHost();
-                        if (!MediaDownloadUtils.isTrustedInstagramHost(host)) return;
-                        // Only cache image CDN URLs, not API calls
-                        if (MediaDownloadUtils.isImageUrl(url)) {
-                            addToCache(IMAGE_CACHE, url);
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            });
-        } catch (Throwable t) {
-            XposedBridge.log("(InstaEclipse | MediaDownload): Tigon hook failed: " + t.getMessage());
-        }
+                });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Public API — called from UIHookManager & BottomSheetHookUtil
+    // Public API — called from BottomSheetHookUtil when a sheet opens
     // ─────────────────────────────────────────────────────────────────────────
 
     /** No-op — floating button removed */
@@ -204,8 +151,8 @@ public class MediaDownloadButtonHook {
     public static void ensureActivityObserver(Activity activity) {}
 
     /**
-     * Injects "Download" and "Download All" rows into the post 3-dot menu.
-     * Called by BottomSheetHookUtil when a bottom sheet opens.
+     * Called by BottomSheetHookUtil when Instagram's 3-dot menu opens.
+     * Injects "Download" (and optionally "Download All") at the top of the sheet.
      */
     public static void injectIntoBottomSheet(Activity activity) {
         if (activity == null || !FeatureFlags.enableMediaDownload) return;
@@ -214,97 +161,246 @@ public class MediaDownloadButtonHook {
                 View decor = activity.getWindow().getDecorView();
                 ViewGroup sheet = findBottomSheet((ViewGroup) decor);
                 if (sheet == null) return;
-                // Already injected?
                 if (sheet.findViewWithTag(SHEET_TAG) != null) return;
 
-                boolean hasVideo = !VIDEO_CACHE.isEmpty();
-                boolean hasImages = !IMAGE_CACHE.isEmpty();
-                int imageCount = IMAGE_CACHE.size();
+                // Determine media type from current model so we can label correctly
+                int mediaType = getMediaType(sCurrentMediaModel);
+                boolean isCarousel = (mediaType == TYPE_CAROUSEL);
+                boolean isVideo    = (mediaType == TYPE_VIDEO);
+                String mediaId     = sCurrentMediaId;
 
-                // "Download" row — downloads the primary media
-                // (video if available, otherwise the latest image)
-                LinearLayout rowDownload = buildSheetRow(activity,
-                        SHEET_TAG,
-                        "⬇  Download" + (hasVideo ? " Video" : hasImages ? " Photo" : ""),
-                        v -> {
-                            dismissSheet(activity);
-                            String url = hasVideo ? VIDEO_CACHE.peekFirst()
-                                                  : (hasImages ? IMAGE_CACHE.peekFirst() : null);
-                            if (url == null) { showToast("No media found"); return; }
-                            triggerDownload(activity.getApplicationContext(),
-                                    java.util.Collections.singletonList(url));
-                        });
+                String downloadLabel = isVideo ? "⬇  Download Video"
+                        : isCarousel ? "⬇  Download Photo"
+                        : "⬇  Download Photo";
+
+                // "Download" row
+                LinearLayout rowDownload = buildRow(activity, SHEET_TAG, downloadLabel, v -> {
+                    dismissSheet(activity);
+                    if (mediaId == null) { showToast("Could not find media ID"); return; }
+                    fetchAndDownload(activity.getApplicationContext(), mediaId, false);
+                });
                 sheet.addView(rowDownload, 0);
 
-                // "Download All" row — only show if carousel (>1 image) or both video+image exist
-                if (imageCount > 1 || (hasVideo && hasImages)) {
-                    List<String> allUrls = new ArrayList<>();
-                    if (hasVideo) allUrls.add(VIDEO_CACHE.peekFirst());
-                    IMAGE_CACHE.forEach(allUrls::add);
-                    int total = allUrls.size();
-
-                    LinearLayout rowAll = buildSheetRow(activity,
-                            SHEET_TAG + "_all",
-                            "⬇  Download All (" + total + ")",
-                            v -> {
+                // "Download All" row — only for carousels
+                if (isCarousel) {
+                    LinearLayout rowAll = buildRow(activity, SHEET_TAG + "_all",
+                            "⬇  Download All", v -> {
                                 dismissSheet(activity);
-                                triggerDownload(activity.getApplicationContext(), allUrls);
+                                if (mediaId == null) { showToast("Could not find media ID"); return; }
+                                fetchAndDownload(activity.getApplicationContext(), mediaId, true);
                             });
                     sheet.addView(rowAll, 1);
                 }
 
             } catch (Throwable t) {
-                XposedBridge.log("(InstaEclipse | MediaDownload): sheet inject failed: " + t);
+                XposedBridge.log(TAG + ": sheet inject failed: " + t);
             }
         }, 250);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Download logic
+    // Core: fetch media info from Instagram API, then download
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static void triggerDownload(Context ctx, List<String> urls) {
-        if (urls.isEmpty()) { showToast("No media found"); return; }
-        showToast("Downloading " + urls.size() + " item(s)…");
-        for (String url : urls) {
-            new Thread(() -> downloadToGallery(ctx, url)).start();
+    /**
+     * Calls https://i.instagram.com/api/v1/media/{media_id}/info/
+     * using the session cookies Instagram already has in CookieManager.
+     * Parses the JSON and downloads the appropriate URL(s).
+     */
+    private static void fetchAndDownload(Context ctx, String mediaId, boolean downloadAll) {
+        showToast("Fetching media info…");
+        sPool.submit(() -> {
+            try {
+                String apiUrl = API_BASE + mediaId + "/info/";
+                String cookie = CookieManager.getInstance().getCookie("https://www.instagram.com");
+                if (cookie == null || cookie.isEmpty()) {
+                    cookie = CookieManager.getInstance().getCookie("https://i.instagram.com");
+                }
+
+                // Fetch media info JSON
+                String json = fetchJson(apiUrl, cookie);
+                if (json == null) {
+                    showToast("Failed to fetch media info");
+                    return;
+                }
+
+                List<String> urls = parseMediaUrls(json, downloadAll);
+                if (urls.isEmpty()) {
+                    showToast("No downloadable media found");
+                    return;
+                }
+
+                showToast("Downloading " + urls.size() + " item(s)…");
+                for (String url : urls) {
+                    downloadFile(ctx, url);
+                }
+
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": fetchAndDownload error: " + t);
+                showToast("Download error: " + t.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Makes the authenticated GET request to the Instagram private API.
+     */
+    private static String fetchJson(String apiUrl, String cookie) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(apiUrl).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent",
+                    "Instagram 275.0.0.27.98 Android (29/10; 420dpi; 1080x2105; "
+                    + "Google/google; Pixel 4; flame; qcom; en_US; 458229237)");
+            conn.setRequestProperty("Accept",           "*/*");
+            conn.setRequestProperty("Accept-Language",  "en-US");
+            conn.setRequestProperty("X-IG-App-ID",      "567067343352427");
+            conn.setRequestProperty("X-IG-Capabilities","3brTvwE=");
+            conn.setRequestProperty("X-IG-Connection-Type", "WIFI");
+            if (cookie != null && !cookie.isEmpty()) {
+                conn.setRequestProperty("Cookie", cookie);
+            }
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(15000);
+            conn.connect();
+
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                XposedBridge.log(TAG + ": API HTTP " + code + " for " + apiUrl);
+                return null;
+            }
+
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line);
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": fetchJson error: " + t.getMessage());
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 
-    private static void downloadToGallery(Context context, String urlString) {
-        HttpURLConnection connection = null;
+    /**
+     * Parses the /info/ JSON response and returns CDN URLs to download.
+     *
+     * JSON structure:
+     * {
+     *   "items": [{
+     *     "media_type": 1|2|8,
+     *     "pk": "12345",
+     *     "image_versions2": { "candidates": [{ "url": "...", "width": N, "height": N }] },
+     *     "video_versions":  [{ "url": "...", "width": N, "height": N }],
+     *     "carousel_media":  [ { same fields as above per slide } ]
+     *   }]
+     * }
+     */
+    private static List<String> parseMediaUrls(String json, boolean downloadAll) {
+        List<String> urls = new ArrayList<>();
+        try {
+            JSONObject root = new JSONObject(json);
+            JSONArray items = root.getJSONArray("items");
+            if (items.length() == 0) return urls;
+            JSONObject item = items.getJSONObject(0);
+            int mediaType = item.optInt("media_type", TYPE_IMAGE);
+
+            if (mediaType == TYPE_CAROUSEL) {
+                JSONArray carousel = item.getJSONArray("carousel_media");
+                if (downloadAll) {
+                    for (int i = 0; i < carousel.length(); i++) {
+                        String url = extractBestUrl(carousel.getJSONObject(i));
+                        if (url != null) urls.add(url);
+                    }
+                } else {
+                    // Download just the first (current) item
+                    if (carousel.length() > 0) {
+                        String url = extractBestUrl(carousel.getJSONObject(0));
+                        if (url != null) urls.add(url);
+                    }
+                }
+            } else {
+                String url = extractBestUrl(item);
+                if (url != null) urls.add(url);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": JSON parse error: " + t.getMessage());
+        }
+        return urls;
+    }
+
+    /**
+     * Picks the highest-quality URL from a single media item.
+     * Prefers video_versions (has audio) over image.
+     */
+    private static String extractBestUrl(JSONObject item) {
+        try {
+            int type = item.optInt("media_type", TYPE_IMAGE);
+
+            // Video — use video_versions[0].url (highest quality, has audio)
+            if (type == TYPE_VIDEO) {
+                JSONArray videoVersions = item.optJSONArray("video_versions");
+                if (videoVersions != null && videoVersions.length() > 0) {
+                    return videoVersions.getJSONObject(0).getString("url");
+                }
+            }
+
+            // Image — use image_versions2.candidates[0].url (highest quality)
+            JSONObject imageVersions = item.optJSONObject("image_versions2");
+            if (imageVersions != null) {
+                JSONArray candidates = imageVersions.optJSONArray("candidates");
+                if (candidates != null && candidates.length() > 0) {
+                    return candidates.getJSONObject(0).getString("url");
+                }
+            }
+
+            // Fallback: try video_versions for carousel video slides
+            JSONArray videoVersions = item.optJSONArray("video_versions");
+            if (videoVersions != null && videoVersions.length() > 0) {
+                return videoVersions.getJSONObject(0).getString("url");
+            }
+
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // File download to gallery
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void downloadFile(Context context, String urlString) {
+        HttpURLConnection conn = null;
         InputStream input = null;
         OutputStream output = null;
         try {
             URL url = new URL(urlString);
-            if (!MediaDownloadUtils.isTrustedInstagramHost(url.getHost())) {
-                showToast("Blocked: untrusted host"); return;
-            }
-
-            connection = (HttpURLConnection) url.openConnection();
-            // Use Instagram's own user-agent so the CDN serves the full file
-            connection.setRequestProperty("User-Agent",
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestProperty("User-Agent",
                     "Instagram 275.0.0.27.98 Android (29/10; 420dpi; 1080x2105; "
                     + "Google/google; Pixel 4; flame; qcom; en_US; 458229237)");
-            connection.setRequestProperty("Referer",   "https://www.instagram.com/");
-            connection.setRequestProperty("Accept",    "*/*");
-            connection.setRequestProperty("Accept-Encoding", "identity"); // no compression
-            connection.setConnectTimeout(15000);
-            connection.setReadTimeout(60000);
-            connection.setInstanceFollowRedirects(true);
-            connection.connect();
+            conn.setRequestProperty("Referer", "https://www.instagram.com/");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(60000);
+            conn.setInstanceFollowRedirects(true);
+            conn.connect();
 
-            int code = connection.getResponseCode();
+            int code = conn.getResponseCode();
             if (code < 200 || code >= 300) {
-                showToast("Download failed (HTTP " + code + ")"); return;
+                showToast("Download failed (HTTP " + code + ")");
+                return;
             }
 
-            input = connection.getInputStream();
+            input = conn.getInputStream();
 
-            // Detect content type from response header first, then URL
-            String contentType = connection.getContentType();
-            boolean isVideo = (contentType != null && contentType.startsWith("video"))
-                    || MediaDownloadUtils.isVideoUrl(urlString);
+            // Detect type from Content-Type header, then URL
+            String ct = conn.getContentType();
+            boolean isVideo = (ct != null && ct.startsWith("video"))
+                    || urlString.contains(".mp4")
+                    || urlString.contains("video_versions");
             String ext = isVideo ? ".mp4" : ".jpg";
             String fileName = "InstaEclipse_" + System.currentTimeMillis()
                     + "_" + UUID.randomUUID().toString().substring(0, 8) + ext;
@@ -317,19 +413,25 @@ public class MediaDownloadButtonHook {
                         (isVideo ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES)
                                 + "/InstaEclipse");
                 cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
                 Uri col = isVideo
                         ? MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
                         : MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
                 Uri item = context.getContentResolver().insert(col, cv);
                 if (item == null) { showToast("Download failed"); return; }
+
                 output = context.getContentResolver().openOutputStream(item);
                 if (output == null) { showToast("Download failed"); return; }
                 copy(input, output);
+
                 ContentValues done = new ContentValues();
                 done.put(MediaStore.MediaColumns.IS_PENDING, 0);
                 context.getContentResolver().update(item, done, null, null);
             } else {
-                if (!hasLegacyPermission(context)) { showToast("Storage permission required"); return; }
+                if (!hasLegacyPermission(context)) {
+                    showToast("Storage permission required");
+                    return;
+                }
                 File dir = new File(Environment.getExternalStoragePublicDirectory(
                         isVideo ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES),
                         "InstaEclipse");
@@ -338,14 +440,84 @@ public class MediaDownloadButtonHook {
                 copy(input, output);
             }
             showToast("Saved ✅ " + (isVideo ? "Movies" : "Pictures") + "/InstaEclipse");
+
         } catch (Throwable t) {
-            XposedBridge.log("(InstaEclipse | MediaDownload): DL error: " + t);
+            XposedBridge.log(TAG + ": downloadFile error: " + t);
             showToast("Download failed");
         } finally {
             try { if (input  != null) input.close();  } catch (Exception ignored) {}
             try { if (output != null) output.close(); } catch (Exception ignored) {}
-            if (connection != null) connection.disconnect();
+            if (conn != null) conn.disconnect();
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Media ID extraction via reflection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Tries to extract a numeric media ID (pk) from any Instagram model object.
+     * Instagram media objects always have a "pk" or "id" field that is the media ID.
+     */
+    private static String extractMediaId(Object obj) {
+        if (obj == null) return null;
+        String pkg = obj.getClass().getName();
+        // Only look at Instagram model objects
+        if (!pkg.startsWith("com.instagram") && !pkg.startsWith("X.")) return null;
+
+        // Try common field names for media ID
+        for (String fieldName : new String[]{"pk", "mPk", "mId", "mediaId", "id", "mMediaId"}) {
+            try {
+                java.lang.reflect.Field f = findField(obj.getClass(), fieldName);
+                if (f == null) continue;
+                f.setAccessible(true);
+                Object val = f.get(obj);
+                if (val == null) continue;
+                String s = val.toString().trim();
+                // Media IDs are long numeric strings (10-20 digits)
+                if (s.matches("\\d{9,20}")) return s;
+            } catch (Throwable ignored) {}
+        }
+
+        // Try getter methods
+        for (String methodName : new String[]{"getPk", "getMediaId", "getId", "getPkAsString"}) {
+            try {
+                Method m = findMethod(obj.getClass(), methodName);
+                if (m == null) continue;
+                m.setAccessible(true);
+                Object val = m.invoke(obj);
+                if (val == null) continue;
+                String s = val.toString().trim();
+                if (s.matches("\\d{9,20}")) return s;
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    /**
+     * Gets the media_type integer from the model object.
+     */
+    private static int getMediaType(Object obj) {
+        if (obj == null) return TYPE_IMAGE;
+        for (String fieldName : new String[]{"mediaType", "mMediaType", "media_type", "type"}) {
+            try {
+                java.lang.reflect.Field f = findField(obj.getClass(), fieldName);
+                if (f == null) continue;
+                f.setAccessible(true);
+                Object val = f.get(obj);
+                if (val instanceof Integer) return (Integer) val;
+            } catch (Throwable ignored) {}
+        }
+        for (String methodName : new String[]{"getMediaType", "getType"}) {
+            try {
+                Method m = findMethod(obj.getClass(), methodName);
+                if (m == null) continue;
+                m.setAccessible(true);
+                Object val = m.invoke(obj);
+                if (val instanceof Integer) return (Integer) val;
+            } catch (Throwable ignored) {}
+        }
+        return TYPE_IMAGE;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -370,57 +542,32 @@ public class MediaDownloadButtonHook {
         if (!(vg instanceof LinearLayout)) return false;
         if (((LinearLayout) vg).getOrientation() != LinearLayout.VERTICAL) return false;
         if (vg.getChildCount() < 2) return false;
-        // Must have at least 2 children that contain text (menu items)
         int textCount = 0;
         for (int i = 0; i < Math.min(vg.getChildCount(), 6); i++) {
-            if (containsTextView(vg.getChildAt(i))) textCount++;
+            if (containsText(vg.getChildAt(i))) textCount++;
         }
         return textCount >= 2;
     }
 
-    private static boolean containsTextView(View v) {
+    private static boolean containsText(View v) {
         if (v instanceof TextView) return true;
         if (v instanceof ViewGroup) {
             ViewGroup vg = (ViewGroup) v;
             for (int i = 0; i < vg.getChildCount(); i++)
-                if (containsTextView(vg.getChildAt(i))) return true;
+                if (containsText(vg.getChildAt(i))) return true;
         }
         return false;
     }
 
-    private static void dismissSheet(Activity activity) {
-        try { activity.onBackPressed(); } catch (Throwable ignored) {}
+    private static void dismissSheet(Activity a) {
+        try { a.onBackPressed(); } catch (Throwable ignored) {}
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Cache helpers
+    // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static void addToCache(ConcurrentLinkedDeque<String> cache, String url) {
-        cache.remove(url);
-        cache.addFirst(url);
-        while (cache.size() > CACHE_MAX) cache.removeLast();
-    }
-
-    private static String extractUrlFromMediaItem(Object item) {
-        if (item == null) return null;
-        try {
-            // ExoPlayer MediaItem.localConfiguration.uri
-            Field lc = findFieldUp(item.getClass(), "localConfiguration");
-            if (lc == null) lc = findFieldUp(item.getClass(), "playbackProperties");
-            if (lc == null) return null;
-            lc.setAccessible(true);
-            Object cfg = lc.get(item);
-            if (cfg == null) return null;
-            Field uriField = findFieldUp(cfg.getClass(), "uri");
-            if (uriField == null) return null;
-            uriField.setAccessible(true);
-            Object uri = uriField.get(cfg);
-            return uri != null ? uri.toString() : null;
-        } catch (Throwable ignored) { return null; }
-    }
-
-    private static Field findFieldUp(Class<?> cls, String name) {
+    private static java.lang.reflect.Field findField(Class<?> cls, String name) {
         while (cls != null && cls != Object.class) {
             try { return cls.getDeclaredField(name); }
             catch (NoSuchFieldException ignored) {}
@@ -429,8 +576,14 @@ public class MediaDownloadButtonHook {
         return null;
     }
 
-    private static String getHost(String url) {
-        try { return new URL(url).getHost(); } catch (Throwable e) { return ""; }
+    private static Method findMethod(Class<?> cls, String name) {
+        while (cls != null && cls != Object.class) {
+            for (Method m : cls.getDeclaredMethods()) {
+                if (m.getName().equals(name) && m.getParameterCount() == 0) return m;
+            }
+            cls = cls.getSuperclass();
+        }
+        return null;
     }
 
     private static void copy(InputStream in, OutputStream out) throws Exception {
@@ -454,11 +607,11 @@ public class MediaDownloadButtonHook {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // UI helpers
+    // UI row builder
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static LinearLayout buildSheetRow(Activity ctx, String tag,
-                                               String label, View.OnClickListener click) {
+    private static LinearLayout buildRow(Activity ctx, String tag,
+                                          String label, View.OnClickListener onClick) {
         LinearLayout row = new LinearLayout(ctx);
         row.setTag(tag);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -472,7 +625,6 @@ public class MediaDownloadButtonHook {
         bg.addState(new int[]{}, new ColorDrawable(Color.TRANSPARENT));
         row.setBackground(bg);
 
-        // Icon
         ImageView icon = new ImageView(ctx);
         icon.setImageDrawable(makeIcon(ctx));
         int sz = dp(ctx, 24);
@@ -481,33 +633,32 @@ public class MediaDownloadButtonHook {
         icon.setLayoutParams(iconLp);
         row.addView(icon);
 
-        // Label
         TextView tv = new TextView(ctx);
         tv.setText(label);
         tv.setTextColor(Color.WHITE);
         tv.setTextSize(16f);
         row.addView(tv);
 
-        row.setOnClickListener(click);
+        row.setOnClickListener(onClick);
         return row;
     }
 
     private static BitmapDrawable makeIcon(Context ctx) {
         int size = dp(ctx, 24);
         Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
-        Canvas canvas = new Canvas(bmp);
-        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        paint.setColor(0xFFFFFFFF);
-        paint.setStrokeWidth(dp(ctx, 2f));
-        paint.setStrokeCap(Paint.Cap.ROUND);
-        paint.setStyle(Paint.Style.STROKE);
+        Canvas c = new Canvas(bmp);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(Color.WHITE);
+        p.setStrokeWidth(dp(ctx, 2f));
+        p.setStrokeCap(Paint.Cap.ROUND);
+        p.setStyle(Paint.Style.STROKE);
         float cx = size / 2f, top = size * .10f, tip = size * .60f;
         float ah = size * .20f, ty = size * .78f, th = size * .32f;
-        canvas.drawLine(cx, top, cx, tip, paint);
+        c.drawLine(cx, top, cx, tip, p);
         Path head = new Path();
         head.moveTo(cx - ah, tip - ah); head.lineTo(cx, tip); head.lineTo(cx + ah, tip - ah);
-        canvas.drawPath(head, paint);
-        canvas.drawLine(cx - th, ty, cx + th, ty, paint);
+        c.drawPath(head, p);
+        c.drawLine(cx - th, ty, cx + th, ty, p);
         return new BitmapDrawable(ctx.getResources(), bmp);
     }
 

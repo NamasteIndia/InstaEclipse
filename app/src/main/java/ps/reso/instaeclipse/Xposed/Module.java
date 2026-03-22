@@ -257,13 +257,8 @@ public class Module implements IXposedHookLoadPackage, IXposedHookZygoteInit {
                         XposedBridge.log("(InstaEclipse | Interceptor): ❌ Failed to hook");
                     }
 
-                    // Media Download — AKinstah-derived approach:
-                    // Hook MediaOptionsOverflowHelper + BottomSheetFragment.onViewCreated
-                    try {
-                        MediaDownloadButtonHook.hookWithDexKit(dexKitBridge, hostClassLoader);
-                    } catch (Throwable e) {
-                        XposedBridge.log("(InstaEclipse | MediaDownload): ❌ Failed: " + e);
-                    }
+                    // Media Download hooks are installed via BottomSheetHookUtil.hookBottomSheetNavigator
+                    // which is called by UIHookManager.mainActivity() above.
 
                 }
 

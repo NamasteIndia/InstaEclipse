@@ -20,12 +20,8 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.luckypray.dexkit.DexKitBridge;
-import org.luckypray.dexkit.query.FindClass;
 import org.luckypray.dexkit.query.FindMethod;
-import org.luckypray.dexkit.query.matchers.ClassMatcher;
 import org.luckypray.dexkit.query.matchers.MethodMatcher;
-import org.luckypray.dexkit.result.ClassData;
-import org.luckypray.dexkit.result.ClassDataList;
 import org.luckypray.dexkit.result.MethodData;
 
 import java.io.BufferedReader;
@@ -55,27 +51,27 @@ import ps.reso.instaeclipse.utils.feature.FeatureStatusTracker;
 /**
  * MediaDownloadButtonHook
  *
- * Architecture derived from reverse-engineering AKinstah v416:
+ * Based on reverse engineering of AKinstah v416 (libajeethk.so + classes17.dex):
  *
- *  AKinstah hooks MediaOptionsOverflowHelper (obfuscated as X/VMZ in Instagram 421,
+ *  KEY FINDING: AKinstah hooks MediaOptionsOverflowHelper (X/VMZ in Instagram 421,
  *  found via __redex_internal_original_name = "MediaOptionsOverflowHelper").
- *  It intercepts the method that receives a com.instagram.feed.media.mediaoption.MediaOption$Option
- *  parameter (the media model for the current post) and injects its download option.
+ *  Media model flows through com.instagram.feed.media.mediaoption.MediaOption$Option.
+ *  Download row injected into BottomSheetFragment via IgdsListCell.
  *
- *  Our approach (no native code needed):
- *  1. Use DexKit to find MediaOptionsOverflowHelper via string "MediaOptionsOverflowHelper"
- *  2. Hook its method that takes a MediaOption$Option — specifically the one called
- *     when the overflow sheet is about to be shown: A0C(MediaOption$Option)void
- *  3. Capture the media model from the parameter
- *  4. Hook BottomSheetFragment.onViewCreated to inject our IgdsListCell Download row
- *  5. On tap: call Instagram private API /api/v1/media/{id}/info/ with session cookie,
- *     parse image_versions2/video_versions, save to gallery
+ *  CRITICAL DESIGN RULES (fixes for previous non-working versions):
+ *  1. Hooks are ALWAYS installed regardless of the feature toggle.
+ *     The toggle is only checked INSIDE hook callbacks (runtime check).
+ *     This is how all other InstaEclipse hooks work (e.g. AdBlocker).
+ *  2. hookWithDexKit() is called exactly ONCE from BottomSheetHookUtil.
+ *  3. sCurrentMediaId is set by MediaOptionsOverflowHelper hook which fires
+ *     when the user taps ⋮ — NOT ahead of time. The BottomSheetFragment
+ *     onViewCreated hook does NOT skip when sCurrentMediaId is null; instead
+ *     it retries for a few seconds.
  */
 public class MediaDownloadButtonHook {
 
     private static final String TAG = "(InstaEclipse | MediaDownload)";
 
-    // Stable class names from APK analysis (not obfuscated)
     private static final String MEDIA_OPTIONS_OVERFLOW_HELPER = "MediaOptionsOverflowHelper";
     private static final String BOTTOM_SHEET_FRAGMENT =
             "com.instagram.igds.components.bottomsheet.BottomSheetFragment";
@@ -88,46 +84,40 @@ public class MediaDownloadButtonHook {
     private static final int TYPE_IMAGE    = 1;
     private static final int TYPE_VIDEO    = 2;
     private static final int TYPE_CAROUSEL = 8;
+    private static final String ROW_TAG    = "ie_dl";
 
-    private static final String ROW_TAG = "ie_dl";
-
-    // Latest captured media model from MediaOptionsOverflowHelper hook
-    private static volatile Object  sCurrentMedia   = null;
-    private static volatile String  sCurrentMediaId = null;
+    // Set by MediaOptionsOverflowHelper hook when user taps ⋮ on a post
+    private static volatile Object sCurrentMedia   = null;
+    private static volatile String sCurrentMediaId = null;
+    private static volatile long   sLastCaptureMs  = 0;
 
     private static final ExecutorService sPool = Executors.newFixedThreadPool(3);
 
     // ─────────────────────────────────────────────────────────────────────────
-    // install() — called from Module.java
+    // install() — legacy entry point, kept for backward compat
     // ─────────────────────────────────────────────────────────────────────────
-
     public void install(XC_LoadPackage.LoadPackageParam lpparam) {
-        // No-op here: DexKit hooks are set up by hookWithDexKit() called from Module
         FeatureStatusTracker.setHooked("MediaDownload");
     }
 
-    /**
-     * Called by Module.java after DexKitBridge is available.
-     * This is the real hook installation point.
-     */
+    // ─────────────────────────────────────────────────────────────────────────
+    // hookWithDexKit() — called ONCE from BottomSheetHookUtil
+    // Installs ALL hooks unconditionally.
+    // Feature toggle is checked inside each callback at runtime.
+    // ─────────────────────────────────────────────────────────────────────────
     public static void hookWithDexKit(DexKitBridge bridge, ClassLoader cl) {
-        if (!FeatureFlags.enableMediaDownload) return;
-
+        XposedBridge.log(TAG + ": hookWithDexKit() called");
         hookMediaOptionsOverflowHelper(bridge, cl);
         hookBottomSheetFragmentOnViewCreated(cl);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Hook 1: MediaOptionsOverflowHelper
-    //
-    // AKinstah uses this as the primary hook to capture the media model.
-    // It's the class that orchestrates the 3-dot post menu.
-    // DexKit finds it via usingStrings("MediaOptionsOverflowHelper").
+    // Fires when user taps ⋮ on a post. Captures the media model + ID.
     // ─────────────────────────────────────────────────────────────────────────
-
     private static void hookMediaOptionsOverflowHelper(DexKitBridge bridge, ClassLoader cl) {
         try {
-            // Find the class using the Redex internal name string (survives obfuscation)
+            // Strategy A: find class via its Redex internal name string
             List<MethodData> methods = bridge.findMethod(
                     FindMethod.create().matcher(
                             MethodMatcher.create()
@@ -135,143 +125,131 @@ public class MediaDownloadButtonHook {
                     )
             );
 
-            if (methods.isEmpty()) {
-                XposedBridge.log(TAG + ": MediaOptionsOverflowHelper not found via string search");
-                // Fallback: hook all methods that receive MediaOption$Option
-                hookByMediaOptionParam(bridge, cl);
-                return;
-            }
+            XposedBridge.log(TAG + ": MediaOptionsOverflowHelper methods found: " + methods.size());
 
-            // Get the owning class
-            String ownerClass = methods.get(0).getClassName();
-            XposedBridge.log(TAG + ": MediaOptionsOverflowHelper = " + ownerClass);
-
-            // Hook ALL methods in this class that take a single Object/MediaOption param
-            // — we want to capture the media model before the menu is shown
-            Class<?> helperClass = cl.loadClass(ownerClass);
-            for (Method m : helperClass.getDeclaredMethods()) {
-                Class<?>[] params = m.getParameterTypes();
-                if (params.length == 0) continue;
-                // Hook methods that take a non-primitive first param (the media model)
-                if (!params[0].isPrimitive() &&
-                    params[0] != String.class &&
-                    params[0] != Context.class &&
-                    params[0] != Activity.class) {
-
-                    m.setAccessible(true);
-                    XposedBridge.hookMethod(m, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!FeatureFlags.enableMediaDownload) return;
-                            // Try to extract media ID from the first param
-                            Object arg = param.args[0];
-                            if (arg == null) return;
-                            String id = extractMediaId(arg);
-                            if (id != null) {
-                                sCurrentMedia   = arg;
-                                sCurrentMediaId = id;
-                                XposedBridge.log(TAG + ": captured mediaId=" + id
-                                        + " from " + m.getName());
-                            }
-                        }
-                    });
+            if (!methods.isEmpty()) {
+                String ownerClass = methods.get(0).getClassName();
+                XposedBridge.log(TAG + ": MediaOptionsOverflowHelper class = " + ownerClass);
+                try {
+                    hookAllMethodsOfClass(cl.loadClass(ownerClass));
+                } catch (ClassNotFoundException e) {
+                    XposedBridge.log(TAG + ": class load failed: " + e.getMessage());
                 }
             }
 
-            // Also hook instance fields to get media when menu helper is constructed
-            hookHelperConstructors(helperClass);
-
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": hookMediaOptionsOverflowHelper failed: " + t);
-        }
-    }
-
-    /**
-     * Fallback: hook by finding methods that accept MediaOption$Option param.
-     * This is what AKinstah's native code does — hooks A0C(MediaOption$Option)V
-     */
-    private static void hookByMediaOptionParam(DexKitBridge bridge, ClassLoader cl) {
-        try {
-            List<MethodData> methods = bridge.findMethod(
+            // Strategy B: hook all methods that accept MediaOption$Option param
+            // (this is exactly what AKinstah hooks as A0C(MediaOption$Option)V)
+            List<MethodData> mediaOptMethods = bridge.findMethod(
                     FindMethod.create().matcher(
                             MethodMatcher.create()
                                     .paramTypes(MEDIA_OPTION_CLASS)
                     )
             );
+            XposedBridge.log(TAG + ": MediaOption$Option param methods: "
+                    + mediaOptMethods.size());
 
-            XposedBridge.log(TAG + ": MediaOption$Option param methods: " + methods.size());
-
-            for (MethodData md : methods) {
+            for (MethodData md : mediaOptMethods) {
                 try {
                     Method m = md.getMethodInstance(cl);
                     m.setAccessible(true);
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            if (!FeatureFlags.enableMediaDownload) return;
-                            // p0 = this (the helper), p1 = MediaOption$Option (the media)
-                            if (param.args.length > 0) {
-                                Object media = param.args[0];
-                                String id = extractMediaId(media);
-                                if (id != null) {
-                                    sCurrentMedia   = media;
-                                    sCurrentMediaId = id;
-                                }
-                            }
-                            // Also check 'this' for media fields
-                            if (param.thisObject != null) {
-                                String id = extractMediaId(param.thisObject);
-                                if (id != null && sCurrentMediaId == null) {
-                                    sCurrentMedia   = param.thisObject;
-                                    sCurrentMediaId = id;
-                                }
-                            }
+                            captureFromArgs(param.args);
+                            if (param.thisObject != null)
+                                captureFromObject(param.thisObject);
                         }
                     });
                 } catch (Throwable ignored) {}
             }
+
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": hookByMediaOptionParam: " + t);
+            XposedBridge.log(TAG + ": hookMediaOptionsOverflowHelper: " + t);
         }
     }
 
-    private static void hookHelperConstructors(Class<?> helperClass) {
-        for (java.lang.reflect.Constructor<?> ctor : helperClass.getDeclaredConstructors()) {
+    private static void hookAllMethodsOfClass(Class<?> cls) {
+        int hooked = 0;
+        for (Method m : cls.getDeclaredMethods()) {
+            Class<?>[] p = m.getParameterTypes();
+            if (p.length == 0) continue;
+            if (p[0].isPrimitive() || p[0] == String.class
+                    || p[0] == Context.class || p[0] == Activity.class) continue;
+            try {
+                m.setAccessible(true);
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        captureFromArgs(param.args);
+                        if (param.thisObject != null)
+                            captureFromObject(param.thisObject);
+                    }
+                });
+                hooked++;
+            } catch (Throwable ignored) {}
+        }
+        // Also hook constructors to capture when helper is first built
+        for (java.lang.reflect.Constructor<?> ctor : cls.getDeclaredConstructors()) {
             try {
                 ctor.setAccessible(true);
                 XposedBridge.hookMethod(ctor, new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
-                        if (!FeatureFlags.enableMediaDownload) return;
-                        // Scan all fields of the newly created helper for a media model
-                        Object helper = param.thisObject;
-                        if (helper == null) return;
-                        for (Field f : getAllFields(helper.getClass())) {
-                            try {
-                                f.setAccessible(true);
-                                Object val = f.get(helper);
-                                if (val == null) continue;
-                                String id = extractMediaId(val);
-                                if (id != null) {
-                                    sCurrentMedia   = val;
-                                    sCurrentMediaId = id;
-                                    return;
-                                }
-                            } catch (Throwable ignored) {}
-                        }
+                        captureFromObject(param.thisObject);
+                        captureFromArgs(param.args);
                     }
                 });
+                hooked++;
+            } catch (Throwable ignored) {}
+        }
+        XposedBridge.log(TAG + ": hooked " + hooked + " methods on " + cls.getName());
+    }
+
+    private static void captureFromArgs(Object[] args) {
+        if (args == null) return;
+        for (Object arg : args) {
+            if (arg == null) continue;
+            String id = extractMediaId(arg);
+            if (id != null) {
+                sCurrentMedia   = arg;
+                sCurrentMediaId = id;
+                sLastCaptureMs  = System.currentTimeMillis();
+                XposedBridge.log(TAG + ": captured mediaId=" + id
+                        + " from " + arg.getClass().getSimpleName());
+                return;
+            }
+        }
+    }
+
+    private static void captureFromObject(Object obj) {
+        if (obj == null) return;
+        String id = extractMediaId(obj);
+        if (id != null) {
+            sCurrentMedia   = obj;
+            sCurrentMediaId = id;
+            sLastCaptureMs  = System.currentTimeMillis();
+        }
+        // Also scan fields of the object for a media model
+        for (Field f : getAllFields(obj.getClass())) {
+            try {
+                if (f.getType().isPrimitive() || f.getType() == String.class) continue;
+                f.setAccessible(true);
+                Object val = f.get(obj);
+                if (val == null) continue;
+                String fid = extractMediaId(val);
+                if (fid != null) {
+                    sCurrentMedia   = val;
+                    sCurrentMediaId = fid;
+                    sLastCaptureMs  = System.currentTimeMillis();
+                    return;
+                }
             } catch (Throwable ignored) {}
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Hook 2: BottomSheetFragment.onViewCreated
-    //
-    // This fires when any bottom sheet is shown. We inject our Download row
-    // into the IgdsListCell container inside the sheet's content view.
     // ─────────────────────────────────────────────────────────────────────────
-
     private static void hookBottomSheetFragmentOnViewCreated(ClassLoader cl) {
         try {
             XposedHelpers.findAndHookMethod(
@@ -281,112 +259,164 @@ public class MediaDownloadButtonHook {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
+                            // Feature check at runtime — not at install time
                             if (!FeatureFlags.enableMediaDownload) return;
                             View sheetView = (View) param.args[0];
                             if (sheetView == null) return;
 
-                            // Only inject if we have a media ID captured recently
-                            if (sCurrentMediaId == null) return;
-
-                            new Handler(Looper.getMainLooper()).postDelayed(() -> {
-                                try {
-                                    injectDownloadRow(sheetView, cl);
-                                } catch (Throwable t) {
-                                    XposedBridge.log(TAG + ": inject error: " + t);
-                                }
-                            }, 150);
+                            // Retry injection a few times to wait for mediaId capture
+                            // (MediaOptionsOverflowHelper fires slightly before/after sheet opens)
+                            tryInjectWithRetry(sheetView, 0);
                         }
                     });
-            XposedBridge.log(TAG + ": hooked BottomSheetFragment.onViewCreated");
+            XposedBridge.log(TAG + ": hooked BottomSheetFragment.onViewCreated ✅");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": BottomSheetFragment hook failed: " + t);
+            XposedBridge.log(TAG + ": BottomSheetFragment hook FAILED: " + t);
         }
+    }
+
+    /**
+     * Tries to inject the Download row up to 5 times, 100ms apart.
+     * This handles the race condition between MediaOptionsOverflowHelper
+     * and BottomSheetFragment.onViewCreated firing order.
+     */
+    private static void tryInjectWithRetry(View sheetView, int attempt) {
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            try {
+                if (!(sheetView instanceof ViewGroup)) return;
+
+                // Check if already injected
+                if (sheetView.findViewWithTag(ROW_TAG) != null) return;
+
+                String mediaId = sCurrentMediaId;
+
+                if (mediaId == null && attempt < 5) {
+                    // MediaId not captured yet — retry
+                    tryInjectWithRetry(sheetView, attempt + 1);
+                    return;
+                }
+
+                // Inject even without mediaId (will show error toast on tap)
+                injectDownloadRow((ViewGroup) sheetView, mediaId);
+
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": inject attempt " + attempt + " failed: " + t);
+            }
+        }, attempt == 0 ? 100 : 150L * attempt);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Inject Download row into the sheet
     // ─────────────────────────────────────────────────────────────────────────
-
-    private static void injectDownloadRow(View sheetRoot, ClassLoader cl) {
-        if (!(sheetRoot instanceof ViewGroup)) return;
-
-        // Find the container with IgdsListCell children
-        ViewGroup container = findIgdsContainer((ViewGroup) sheetRoot);
+    private static void injectDownloadRow(ViewGroup sheetRoot, String mediaId) {
+        // Find container with IgdsListCell children
+        ViewGroup container = findIgdsContainer(sheetRoot);
         if (container == null) {
-            XposedBridge.log(TAG + ": no IgdsListCell container found");
+            XposedBridge.log(TAG + ": no IgdsListCell container — trying BFS fallback");
+            container = findAnyMenuContainer(sheetRoot);
+        }
+        if (container == null) {
+            XposedBridge.log(TAG + ": no container found at all");
             return;
         }
         if (container.findViewWithTag(ROW_TAG) != null) return;
 
-        String mediaId = sCurrentMediaId;
-        if (mediaId == null) return;
-
         Context ctx = sheetRoot.getContext();
-        int mediaType = getMediaType(sCurrentMedia);
+        int     mediaType = getMediaType(sCurrentMedia);
+        boolean isVideo   = (mediaType == TYPE_VIDEO);
+        boolean isCarousel= (mediaType == TYPE_CAROUSEL);
 
-        String label = (mediaType == TYPE_VIDEO) ? "⬇  Download Video"
-                     : (mediaType == TYPE_CAROUSEL) ? "⬇  Download Photo"
+        String label = isVideo ? "⬇  Download Video"
+                     : isCarousel ? "⬇  Download Photo"
                      : "⬇  Download Photo";
 
-        View row = buildRow(ctx, cl, ROW_TAG, label, v -> {
+        final String capturedId = mediaId; // final for lambda
+
+        View row = buildRow(ctx, ROW_TAG, label, v -> {
             dismissSheet(ctx);
-            fetchAndDownload(ctx.getApplicationContext(), mediaId, false);
+            if (capturedId == null) { showToast(ctx, "Media ID not found — scroll past a post first"); return; }
+            fetchAndDownload(ctx.getApplicationContext(), capturedId, false);
         });
 
-        if (row != null) {
-            container.addView(row, 0);
-            XposedBridge.log(TAG + ": injected Download row, mediaId=" + mediaId);
-        }
+        container.addView(row, 0);
+        XposedBridge.log(TAG + ": ✅ injected Download row, mediaId=" + mediaId
+                + " container=" + container.getClass().getSimpleName()
+                + " children=" + container.getChildCount());
 
-        // "Download All" for carousels
-        if (mediaType == TYPE_CAROUSEL) {
-            View rowAll = buildRow(ctx, cl, ROW_TAG + "_all", "⬇  Download All", v -> {
+        if (isCarousel) {
+            View rowAll = buildRow(ctx, ROW_TAG + "_all", "⬇  Download All", v -> {
                 dismissSheet(ctx);
-                fetchAndDownload(ctx.getApplicationContext(), mediaId, true);
+                if (capturedId == null) { showToast(ctx, "Media ID not found"); return; }
+                fetchAndDownload(ctx.getApplicationContext(), capturedId, true);
             });
-            if (rowAll != null) container.addView(rowAll, 1);
+            container.addView(rowAll, 1);
         }
     }
 
-    /**
-     * BFS to find a ViewGroup that contains ≥2 IgdsListCell children.
-     */
     private static ViewGroup findIgdsContainer(ViewGroup root) {
         java.util.Queue<ViewGroup> q = new java.util.LinkedList<>();
         q.add(root);
         while (!q.isEmpty()) {
             ViewGroup vg = q.poll();
-            int cellCount = 0;
+            int cells = 0;
             for (int i = 0; i < vg.getChildCount(); i++) {
                 View c = vg.getChildAt(i);
-                if (c.getClass().getName().equals(IGDS_LIST_CELL)) cellCount++;
+                if (c.getClass().getName().equals(IGDS_LIST_CELL)) cells++;
                 if (c instanceof ViewGroup) q.add((ViewGroup) c);
             }
-            if (cellCount >= 2) return vg;
+            if (cells >= 1) return vg; // even 1 cell is enough — it's a menu list
         }
         return null;
     }
 
-    /**
-     * Build a real IgdsListCell row via reflection.
-     * From AKinstah analysis: IgdsListCell.A0J(CharSequence) sets title,
-     * IgdsListCell.A0F(OnClickListener) sets click handler.
-     */
-    private static View buildRow(Context ctx, ClassLoader cl, String tag,
+    /** Fallback: find any vertical LinearLayout with ≥2 children containing text */
+    private static ViewGroup findAnyMenuContainer(ViewGroup root) {
+        java.util.Queue<ViewGroup> q = new java.util.LinkedList<>();
+        q.add(root);
+        ViewGroup best = null; int bestScore = 0;
+        while (!q.isEmpty()) {
+            ViewGroup vg = q.poll();
+            if (vg instanceof android.widget.LinearLayout &&
+                ((android.widget.LinearLayout)vg).getOrientation()
+                        == android.widget.LinearLayout.VERTICAL) {
+                int score = 0;
+                for (int i = 0; i < vg.getChildCount(); i++) {
+                    if (hasText(vg.getChildAt(i))) score++;
+                }
+                if (score > bestScore) { bestScore = score; best = vg; }
+            }
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (vg.getChildAt(i) instanceof ViewGroup)
+                    q.add((ViewGroup) vg.getChildAt(i));
+            }
+        }
+        return bestScore >= 2 ? best : null;
+    }
+
+    private static boolean hasText(View v) {
+        if (v instanceof android.widget.TextView) return true;
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup)v;
+            for (int i=0;i<vg.getChildCount();i++)
+                if (vg.getChildAt(i) instanceof android.widget.TextView) return true;
+        }
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Build a real IgdsListCell row
+    // ─────────────────────────────────────────────────────────────────────────
+    private static View buildRow(Context ctx, String tag,
                                   String label, View.OnClickListener onClick) {
         try {
+            ClassLoader cl = ctx.getClassLoader();
             Class<?> cellClass = cl.loadClass(IGDS_LIST_CELL);
 
-            // Find Context-only constructor
+            // Find Context-only constructor (or Context + nulls)
             Object cell = null;
             for (java.lang.reflect.Constructor<?> ctor : cellClass.getDeclaredConstructors()) {
                 Class<?>[] p = ctor.getParameterTypes();
-                if (p.length == 1 && p[0] == Context.class) {
-                    ctor.setAccessible(true);
-                    cell = ctor.newInstance(ctx);
-                    break;
-                }
-                if (p.length > 0 && p[0] == Context.class) {
+                if (p.length >= 1 && p[0] == Context.class) {
                     ctor.setAccessible(true);
                     Object[] args = new Object[p.length];
                     args[0] = ctx;
@@ -396,15 +426,21 @@ public class MediaDownloadButtonHook {
             }
             if (cell == null) return buildFallbackRow(ctx, tag, label, onClick);
 
-            View cellView = (View) cell;
-            cellView.setTag(tag);
+            View cv = (View) cell;
+            cv.setTag(tag);
 
-            // Set title via A0J(CharSequence) — confirmed from IgdsListCell smali
-            try {
-                Method setTitle = cellClass.getMethod("A0J", CharSequence.class);
-                setTitle.invoke(cell, label);
-            } catch (NoSuchMethodException e) {
-                // Try alternate: set text directly on A04 field (IgTextView title)
+            // Set title — A0J(CharSequence) confirmed from IgdsListCell smali analysis
+            boolean titled = false;
+            for (String mname : new String[]{"A0J", "setTitle", "setTitleText"}) {
+                try {
+                    Method m = cellClass.getMethod(mname, CharSequence.class);
+                    m.invoke(cell, label);
+                    titled = true;
+                    break;
+                } catch (NoSuchMethodException ignored) {}
+            }
+            if (!titled) {
+                // Fallback: set text on field A04 (IgTextView title)
                 Field f = findField(cellClass, "A04");
                 if (f != null) {
                     f.setAccessible(true);
@@ -414,38 +450,41 @@ public class MediaDownloadButtonHook {
                 }
             }
 
-            // Set click listener via A0F(OnClickListener) — confirmed from IgdsListCell smali
-            try {
-                Method setClick = cellClass.getMethod("A0F", View.OnClickListener.class);
-                setClick.invoke(cell, onClick);
-            } catch (NoSuchMethodException e) {
-                cellView.setOnClickListener(onClick);
+            // Set click — A0F(OnClickListener) confirmed from IgdsListCell smali analysis
+            boolean clicked = false;
+            for (String mname : new String[]{"A0F", "setOnItemClickListener"}) {
+                try {
+                    Method m = cellClass.getMethod(mname, View.OnClickListener.class);
+                    m.invoke(cell, onClick);
+                    clicked = true;
+                    break;
+                } catch (NoSuchMethodException ignored) {}
             }
+            if (!clicked) cv.setOnClickListener(onClick);
 
-            return cellView;
+            return cv;
 
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": buildRow fallback: " + t.getMessage());
+            XposedBridge.log(TAG + ": IgdsListCell build failed (" + t.getMessage()
+                    + "), using fallback");
             return buildFallbackRow(ctx, tag, label, onClick);
         }
     }
 
-    private static View buildFallbackRow(Context ctx, String tag, String label,
-                                          View.OnClickListener onClick) {
+    private static View buildFallbackRow(Context ctx, String tag,
+                                          String label, View.OnClickListener onClick) {
         android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
         row.setTag(tag);
         row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
         row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        int p = dp(ctx, 16);
-        row.setPadding(p, dp(ctx, 14), p, dp(ctx, 14));
-
+        int pad = dp(ctx, 16);
+        row.setPadding(pad, dp(ctx, 14), pad, dp(ctx, 14));
         android.graphics.drawable.StateListDrawable bg =
                 new android.graphics.drawable.StateListDrawable();
         bg.addState(new int[]{android.R.attr.state_pressed},
                 new android.graphics.drawable.ColorDrawable(0x18000000));
         bg.addState(new int[]{}, new android.graphics.drawable.ColorDrawable(0));
         row.setBackground(bg);
-
         android.widget.TextView tv = new android.widget.TextView(ctx);
         tv.setText(label);
         tv.setTextSize(16f);
@@ -456,43 +495,34 @@ public class MediaDownloadButtonHook {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Public API — kept for backward compat with BottomSheetHookUtil
+    // Public API kept for BottomSheetHookUtil backward compat
     // ─────────────────────────────────────────────────────────────────────────
-
     public static void attachButtonIfNeeded(Activity activity) {}
     public static void ensureActivityObserver(Activity activity) {}
     public static void injectIntoBottomSheet(Activity activity) {}
-    public static void injectIntoSheetView(View sheetRoot, Activity activity) {
-        if (!FeatureFlags.enableMediaDownload || sheetRoot == null) return;
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            try {
-                injectDownloadRow(sheetRoot, Module.hostClassLoader);
-            } catch (Throwable t) {
-                XposedBridge.log(TAG + ": injectIntoSheetView: " + t);
-            }
-        }, 200);
-    }
+    public static void injectIntoSheetView(View sheetRoot, Activity activity) {}
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Download via Instagram private API (same as AeroInsta / proven approach)
+    // Download via Instagram private API
     // ─────────────────────────────────────────────────────────────────────────
-
-    private static void fetchAndDownload(Context ctx, String mediaId, boolean downloadAll) {
+    private static void fetchAndDownload(Context ctx, String mediaId, boolean all) {
         showToast(ctx, "Fetching media...");
         sPool.submit(() -> {
             try {
-                String cookie = CookieManager.getInstance().getCookie("https://www.instagram.com");
+                String cookie = CookieManager.getInstance()
+                        .getCookie("https://www.instagram.com");
                 if (cookie == null || cookie.isEmpty())
-                    cookie = CookieManager.getInstance().getCookie("https://i.instagram.com");
+                    cookie = CookieManager.getInstance()
+                            .getCookie("https://i.instagram.com");
 
                 String json = fetchJson(API_BASE + mediaId + "/info/", cookie);
                 if (json == null) { showToast(ctx, "Failed to fetch media info"); return; }
 
-                List<String> urls = parseUrls(json, downloadAll);
+                List<String> urls = parseUrls(json, all);
                 if (urls.isEmpty()) { showToast(ctx, "No downloadable media found"); return; }
 
                 showToast(ctx, "Downloading " + urls.size() + " item(s)...");
-                for (String url : urls) downloadFile(ctx, url);
+                for (String u : urls) downloadFile(ctx, u);
 
             } catch (Throwable t) {
                 XposedBridge.log(TAG + ": fetchAndDownload: " + t);
@@ -518,10 +548,9 @@ public class MediaDownloadButtonHook {
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(15000);
             conn.connect();
-            if (conn.getResponseCode() != 200) {
-                XposedBridge.log(TAG + ": API HTTP " + conn.getResponseCode());
-                return null;
-            }
+            int code = conn.getResponseCode();
+            XposedBridge.log(TAG + ": API response " + code + " for " + apiUrl);
+            if (code != 200) return null;
             StringBuilder sb = new StringBuilder();
             try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
@@ -543,8 +572,8 @@ public class MediaDownloadButtonHook {
             JSONObject root  = new JSONObject(json);
             JSONArray  items = root.getJSONArray("items");
             if (items.length() == 0) return urls;
-            JSONObject item = items.getJSONObject(0);
-            int type = item.optInt("media_type", TYPE_IMAGE);
+            JSONObject item  = items.getJSONObject(0);
+            int        type  = item.optInt("media_type", TYPE_IMAGE);
 
             if (type == TYPE_CAROUSEL) {
                 JSONArray carousel = item.getJSONArray("carousel_media");
@@ -585,8 +614,7 @@ public class MediaDownloadButtonHook {
 
     private static void downloadFile(Context ctx, String urlStr) {
         HttpURLConnection conn = null;
-        InputStream  in  = null;
-        OutputStream out = null;
+        InputStream in = null; OutputStream out = null;
         try {
             conn = (HttpURLConnection) new URL(urlStr).openConnection();
             conn.setRequestProperty("User-Agent",
@@ -597,26 +625,23 @@ public class MediaDownloadButtonHook {
             conn.setReadTimeout(60000);
             conn.setInstanceFollowRedirects(true);
             conn.connect();
-
             int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) { showToast(ctx, "Download failed (HTTP " + code + ")"); return; }
-
+            if (code < 200 || code >= 300) { showToast(ctx, "Download failed (HTTP "+code+")"); return; }
             in = conn.getInputStream();
             String ct = conn.getContentType();
-            boolean isVideo = (ct != null && ct.startsWith("video")) || urlStr.contains(".mp4");
-            String ext  = isVideo ? ".mp4" : ".jpg";
-            String name = "InstaEclipse_" + System.currentTimeMillis()
-                        + "_" + UUID.randomUUID().toString().substring(0, 6) + ext;
-
+            boolean isVid = (ct != null && ct.startsWith("video")) || urlStr.contains(".mp4");
+            String  ext   = isVid ? ".mp4" : ".jpg";
+            String  name  = "InstaEclipse_" + System.currentTimeMillis()
+                          + "_" + UUID.randomUUID().toString().substring(0,6) + ext;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ContentValues cv = new ContentValues();
                 cv.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
-                cv.put(MediaStore.MediaColumns.MIME_TYPE, isVideo ? "video/mp4" : "image/jpeg");
+                cv.put(MediaStore.MediaColumns.MIME_TYPE, isVid ? "video/mp4" : "image/jpeg");
                 cv.put(MediaStore.MediaColumns.RELATIVE_PATH,
-                        (isVideo ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES)
+                        (isVid ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES)
                                 + "/InstaEclipse");
                 cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
-                Uri col = isVideo
+                Uri col = isVid
                         ? MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
                         : MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
                 Uri uri = ctx.getContentResolver().insert(col, cv);
@@ -628,15 +653,15 @@ public class MediaDownloadButtonHook {
                 done.put(MediaStore.MediaColumns.IS_PENDING, 0);
                 ctx.getContentResolver().update(uri, done, null, null);
             } else {
-                if (!hasStoragePerm(ctx)) { showToast(ctx, "Storage permission required"); return; }
+                if (!hasPerm(ctx)) { showToast(ctx, "Storage permission required"); return; }
                 File dir = new File(Environment.getExternalStoragePublicDirectory(
-                        isVideo ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES),
+                        isVid ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES),
                         "InstaEclipse");
                 dir.mkdirs();
                 out = new FileOutputStream(new File(dir, name));
                 pipe(in, out);
             }
-            showToast(ctx, "Saved ✅ " + (isVideo ? "Movies" : "Pictures") + "/InstaEclipse");
+            showToast(ctx, "Saved ✅ " + (isVid ? "Movies" : "Pictures") + "/InstaEclipse");
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": downloadFile: " + t);
             showToast(ctx, "Download failed");
@@ -650,16 +675,13 @@ public class MediaDownloadButtonHook {
     // ─────────────────────────────────────────────────────────────────────────
     // Reflection helpers
     // ─────────────────────────────────────────────────────────────────────────
-
     private static String extractMediaId(Object obj) {
         if (obj == null) return null;
         String cls = obj.getClass().getName();
-        // Only look at Instagram model objects
         if (!cls.startsWith("com.instagram") && !cls.startsWith("X.")) return null;
 
-        // Try known field names for media pk
-        for (String name : new String[]{"pk", "mPk", "mId", "mediaId", "id", "mMediaId",
-                                         "A00", "A01", "A02", "A03"}) {
+        // Named fields first
+        for (String name : new String[]{"pk", "mPk", "id", "mId", "mediaId", "mMediaId"}) {
             try {
                 Field f = findField(obj.getClass(), name);
                 if (f == null) continue;
@@ -670,9 +692,8 @@ public class MediaDownloadButtonHook {
                 if (s.matches("\\d{9,20}")) return s;
             } catch (Throwable ignored) {}
         }
-
-        // Try getter methods
-        for (String name : new String[]{"getPk", "getMediaId", "getId", "getMediaPk"}) {
+        // Getter methods
+        for (String name : new String[]{"getPk", "getId", "getMediaId", "getMediaPk"}) {
             try {
                 Method m = findMethod(obj.getClass(), name);
                 if (m == null) continue;
@@ -683,8 +704,7 @@ public class MediaDownloadButtonHook {
                 if (s.matches("\\d{9,20}")) return s;
             } catch (Throwable ignored) {}
         }
-
-        // Deep search: scan all Long/String fields for a media ID
+        // Scan all Long/String fields
         for (Field f : getAllFields(obj.getClass())) {
             try {
                 if (f.getType() != Long.TYPE && f.getType() != Long.class
@@ -701,16 +721,15 @@ public class MediaDownloadButtonHook {
 
     private static int getMediaType(Object obj) {
         if (obj == null) return TYPE_IMAGE;
-        for (String name : new String[]{"mediaType", "mMediaType", "media_type", "type",
-                                         "mType", "A00", "A01"}) {
+        for (String name : new String[]{"mediaType","mMediaType","media_type","mType","type"}) {
             try {
                 Field f = findField(obj.getClass(), name);
                 if (f == null || f.getType() != Integer.TYPE) continue;
                 f.setAccessible(true);
                 Object v = f.get(obj);
                 if (v instanceof Integer) {
-                    int t = (Integer) v;
-                    if (t == TYPE_IMAGE || t == TYPE_VIDEO || t == TYPE_CAROUSEL) return t;
+                    int t = (Integer)v;
+                    if (t==TYPE_IMAGE||t==TYPE_VIDEO||t==TYPE_CAROUSEL) return t;
                 }
             } catch (Throwable ignored) {}
         }
@@ -718,12 +737,12 @@ public class MediaDownloadButtonHook {
     }
 
     private static List<Field> getAllFields(Class<?> cls) {
-        List<Field> fields = new ArrayList<>();
+        List<Field> list = new ArrayList<>();
         while (cls != null && cls != Object.class) {
-            for (Field f : cls.getDeclaredFields()) fields.add(f);
+            for (Field f : cls.getDeclaredFields()) list.add(f);
             cls = cls.getSuperclass();
         }
-        return fields;
+        return list;
     }
 
     private static Field findField(Class<?> cls, String name) {
@@ -738,18 +757,14 @@ public class MediaDownloadButtonHook {
     private static Method findMethod(Class<?> cls, String name) {
         while (cls != null && cls != Object.class) {
             for (Method m : cls.getDeclaredMethods())
-                if (m.getName().equals(name) && m.getParameterCount() == 0) return m;
+                if (m.getName().equals(name) && m.getParameterCount()==0) return m;
             cls = cls.getSuperclass();
         }
         return null;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Misc helpers
-    // ─────────────────────────────────────────────────────────────────────────
-
     private static void dismissSheet(Context ctx) {
-        try { ((Activity) ctx).onBackPressed(); } catch (Throwable ignored) {}
+        try { ((Activity)ctx).onBackPressed(); } catch (Throwable ignored) {}
     }
 
     private static void pipe(InputStream in, OutputStream out) throws Exception {
@@ -758,7 +773,7 @@ public class MediaDownloadButtonHook {
         out.flush();
     }
 
-    private static boolean hasStoragePerm(Context ctx) {
+    private static boolean hasPerm(Context ctx) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return true;
         return ctx.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 == PackageManager.PERMISSION_GRANTED;

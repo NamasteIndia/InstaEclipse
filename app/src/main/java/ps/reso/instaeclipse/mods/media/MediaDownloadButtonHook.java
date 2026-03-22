@@ -2,7 +2,6 @@ package ps.reso.instaeclipse.mods.media;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.app.AndroidAppHelper;
 import android.content.ContentValues;
 import android.content.Context;
@@ -56,36 +55,20 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 import ps.reso.instaeclipse.utils.feature.FeatureStatusTracker;
 
-/**
- * MediaDownloadButtonHook
- *
- * Approach (same as AeroInsta):
- *  1. Hook the 3-dot menu bottom sheet to inject "Download" and "Download All" rows.
- *  2. Intercept the media model object that Instagram passes when opening the menu,
- *     extract the media_id (pk) from it via reflection.
- *  3. On tap, call https://i.instagram.com/api/v1/media/{media_id}/info/ using the
- *     session cookies already stored by Instagram's WebView (CookieManager).
- *  4. Parse JSON:
- *       Single image  -> items[0].image_versions2.candidates[0].url
- *       Single video  -> items[0].video_versions[0].url
- *       Carousel      -> items[0].carousel_media[N].(image|video)
- *  5. Download each URL with a background thread + MediaStore.
- */
 public class MediaDownloadButtonHook {
 
-    private static final String TAG = "(InstaEclipse | MediaDownload)";
-    private static final String API_BASE = "https://i.instagram.com/api/v1/media/";
-    private static final String SHEET_TAG = "ie_dl_row";
+    private static final String TAG        = "(InstaEclipse | MediaDownload)";
+    private static final String API_BASE   = "https://i.instagram.com/api/v1/media/";
+    private static final String ROW_TAG    = "ie_dl_row";
+    private static final String ROW_ALL_TAG = "ie_dl_row_all";
 
-    // Media type constants (Instagram internal)
     private static final int TYPE_IMAGE    = 1;
     private static final int TYPE_VIDEO    = 2;
     private static final int TYPE_CAROUSEL = 8;
 
-    // Most-recently-seen media object (set when 3-dot menu opens)
+    // Latest media model captured when user opens a 3-dot menu
     private static volatile Object sCurrentMediaModel = null;
-    // Most-recently-seen media_id string
-    private static volatile String sCurrentMediaId = null;
+    private static volatile String sCurrentMediaId    = null;
 
     private static final ExecutorService sPool = Executors.newFixedThreadPool(4);
 
@@ -94,157 +77,203 @@ public class MediaDownloadButtonHook {
     // ─────────────────────────────────────────────────────────────────────────
 
     public void install(XC_LoadPackage.LoadPackageParam lpparam) {
-        hookMenuOpening(lpparam.classLoader);
+        captureMediaModel();
         FeatureStatusTracker.setHooked("MediaDownload");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Hook: capture media model when user taps the 3-dot menu
-    //
-    // Instagram sets the media model on the bottom sheet before showing it.
-    // We hook the most likely entry points to capture it.
+    // Capture media model via View.setTag hooks
     // ─────────────────────────────────────────────────────────────────────────
 
-    private void hookMenuOpening(ClassLoader cl) {
-        // Hook View.setTag — Instagram sets the media object as view tag
-        // on action rows before the menu opens. We scan for media-like objects.
+    private void captureMediaModel() {
         XposedHelpers.findAndHookMethod(View.class, "setTag", Object.class,
                 new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!FeatureFlags.enableMediaDownload) return;
-                        Object tag = param.args[0];
-                        if (tag == null) return;
-                        String mediaId = extractMediaId(tag);
-                        if (mediaId != null) {
-                            sCurrentMediaModel = tag;
-                            sCurrentMediaId = mediaId;
-                        }
+                        tryCapture(param.args[0]);
                     }
                 });
 
-        // Also hook View.setTag(int, Object) for keyed tags
         XposedHelpers.findAndHookMethod(View.class, "setTag", int.class, Object.class,
                 new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         if (!FeatureFlags.enableMediaDownload) return;
-                        Object tag = param.args[1];
-                        if (tag == null) return;
-                        String mediaId = extractMediaId(tag);
-                        if (mediaId != null) {
-                            sCurrentMediaModel = tag;
-                            sCurrentMediaId = mediaId;
-                        }
+                        tryCapture(param.args[1]);
                     }
                 });
     }
 
+    private static void tryCapture(Object tag) {
+        if (tag == null) return;
+        String pkg = tag.getClass().getName();
+        if (!pkg.startsWith("com.instagram") && !pkg.startsWith("X.")) return;
+        String id = extractMediaId(tag);
+        if (id != null) {
+            sCurrentMediaModel = tag;
+            sCurrentMediaId    = id;
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
-    // Public API — called from BottomSheetHookUtil when a sheet opens
+    // Public API — no-ops kept for backward compat
     // ─────────────────────────────────────────────────────────────────────────
 
-    /** No-op — floating button removed */
     public static void attachButtonIfNeeded(Activity activity) {}
-
-    /** No-op — floating button removed */
     public static void ensureActivityObserver(Activity activity) {}
+    /** Legacy entry-point kept for BottomSheetHookUtil — delegates to injectIntoSheetView */
+    public static void injectIntoBottomSheet(Activity activity) {}
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Main injection — called by BottomSheetHookUtil with the ACTUAL sheet view
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Called by BottomSheetHookUtil when Instagram's 3-dot menu opens.
-     * Injects "Download" (and optionally "Download All") at the top of the sheet.
+     * Called with the sheet's root view immediately after it is created.
+     * We walk the tree to find the vertical list container and prepend our rows.
+     *
+     * Instagram's post menu sheet structure (from screenshot analysis):
+     *   FrameLayout (sheet container)
+     *     LinearLayout (vertical — the menu list)
+     *       LinearLayout (row: Unsave/QR icon buttons, horizontal)
+     *       LinearLayout (row: Why you're seeing this)
+     *       LinearLayout (row: Not interested)
+     *       ...
+     *
+     * We find the first vertical LinearLayout that has ≥ 2 children
+     * containing text-like content and insert our rows at position 0.
      */
-    public static void injectIntoBottomSheet(Activity activity) {
-        if (activity == null || !FeatureFlags.enableMediaDownload) return;
+    public static void injectIntoSheetView(View sheetRoot, Activity activity) {
+        if (!FeatureFlags.enableMediaDownload) return;
+        if (sheetRoot == null) return;
+
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             try {
-                View decor = activity.getWindow().getDecorView();
-                ViewGroup sheet = findBottomSheet((ViewGroup) decor);
-                if (sheet == null) return;
-                if (sheet.findViewWithTag(SHEET_TAG) != null) return;
+                // Already injected into this exact view?
+                if (sheetRoot.findViewWithTag(ROW_TAG) != null) return;
 
-                // Determine media type from current model so we can label correctly
-                int mediaType = getMediaType(sCurrentMediaModel);
+                ViewGroup container = findMenuContainer(sheetRoot);
+                if (container == null) {
+                    XposedBridge.log(TAG + ": could not find menu container in sheet");
+                    return;
+                }
+
+                int mediaType  = getMediaType(sCurrentMediaModel);
                 boolean isCarousel = (mediaType == TYPE_CAROUSEL);
                 boolean isVideo    = (mediaType == TYPE_VIDEO);
                 String mediaId     = sCurrentMediaId;
 
-                String downloadLabel = isVideo ? "⬇  Download Video"
-                        : isCarousel ? "⬇  Download Photo"
-                        : "⬇  Download Photo";
+                String downloadLabel = isVideo    ? "⬇  Download Video"
+                                     : isCarousel ? "⬇  Download Photo"
+                                     :              "⬇  Download Photo";
 
                 // "Download" row
-                LinearLayout rowDownload = buildRow(activity, SHEET_TAG, downloadLabel, v -> {
+                View rowDownload = buildRow(activity, ROW_TAG, downloadLabel, v -> {
                     dismissSheet(activity);
                     if (mediaId == null) { showToast("Could not find media ID"); return; }
                     fetchAndDownload(activity.getApplicationContext(), mediaId, false);
                 });
-                sheet.addView(rowDownload, 0);
+                container.addView(rowDownload, 0);
 
                 // "Download All" row — only for carousels
                 if (isCarousel) {
-                    LinearLayout rowAll = buildRow(activity, SHEET_TAG + "_all",
-                            "⬇  Download All", v -> {
-                                dismissSheet(activity);
-                                if (mediaId == null) { showToast("Could not find media ID"); return; }
-                                fetchAndDownload(activity.getApplicationContext(), mediaId, true);
-                            });
-                    sheet.addView(rowAll, 1);
+                    View rowAll = buildRow(activity, ROW_ALL_TAG, "⬇  Download All", v -> {
+                        dismissSheet(activity);
+                        if (mediaId == null) { showToast("Could not find media ID"); return; }
+                        fetchAndDownload(activity.getApplicationContext(), mediaId, true);
+                    });
+                    container.addView(rowAll, 1);
                 }
 
+                XposedBridge.log(TAG + ": injected into sheet, mediaId=" + mediaId
+                        + " type=" + mediaType);
+
             } catch (Throwable t) {
-                XposedBridge.log(TAG + ": sheet inject failed: " + t);
+                XposedBridge.log(TAG + ": injectIntoSheetView failed: " + t);
             }
-        }, 250);
+        }, 150);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Core: fetch media info from Instagram API, then download
+    // Find the vertical menu list inside the sheet
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Calls https://i.instagram.com/api/v1/media/{media_id}/info/
-     * using the session cookies Instagram already has in CookieManager.
-     * Parses the JSON and downloads the appropriate URL(s).
-     */
-    private static void fetchAndDownload(Context ctx, String mediaId, boolean downloadAll) {
+    private static ViewGroup findMenuContainer(View root) {
+        // BFS — find the vertical LinearLayout with the most text-containing children
+        java.util.Queue<View> q = new java.util.LinkedList<>();
+        q.add(root);
+        ViewGroup best = null;
+        int bestScore  = 0;
+
+        while (!q.isEmpty()) {
+            View v = q.poll();
+            if (v instanceof LinearLayout) {
+                LinearLayout ll = (LinearLayout) v;
+                if (ll.getOrientation() == LinearLayout.VERTICAL && ll.getChildCount() >= 2) {
+                    int score = countTextChildren(ll);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = ll;
+                    }
+                }
+            }
+            if (v instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) v;
+                for (int i = 0; i < vg.getChildCount(); i++) q.add(vg.getChildAt(i));
+            }
+        }
+        return best;
+    }
+
+    /** Count direct or shallow children that contain a TextView */
+    private static int countTextChildren(ViewGroup vg) {
+        int count = 0;
+        for (int i = 0; i < vg.getChildCount(); i++) {
+            if (containsText(vg.getChildAt(i))) count++;
+        }
+        return count;
+    }
+
+    private static boolean containsText(View v) {
+        if (v instanceof TextView) return true;
+        if (v instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) v;
+            for (int i = 0; i < Math.min(vg.getChildCount(), 4); i++)
+                if (vg.getChildAt(i) instanceof TextView) return true;
+        }
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Instagram private API: fetch /info/ and download
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void fetchAndDownload(Context ctx, String mediaId, boolean all) {
         showToast("Fetching media info…");
         sPool.submit(() -> {
             try {
                 String apiUrl = API_BASE + mediaId + "/info/";
                 String cookie = CookieManager.getInstance().getCookie("https://www.instagram.com");
-                if (cookie == null || cookie.isEmpty()) {
+                if (cookie == null || cookie.isEmpty())
                     cookie = CookieManager.getInstance().getCookie("https://i.instagram.com");
-                }
 
-                // Fetch media info JSON
                 String json = fetchJson(apiUrl, cookie);
-                if (json == null) {
-                    showToast("Failed to fetch media info");
-                    return;
-                }
+                if (json == null) { showToast("Failed to fetch media info"); return; }
 
-                List<String> urls = parseMediaUrls(json, downloadAll);
-                if (urls.isEmpty()) {
-                    showToast("No downloadable media found");
-                    return;
-                }
+                List<String> urls = parseMediaUrls(json, all);
+                if (urls.isEmpty()) { showToast("No downloadable media found"); return; }
 
                 showToast("Downloading " + urls.size() + " item(s)…");
-                for (String url : urls) {
-                    downloadFile(ctx, url);
-                }
+                for (String url : urls) downloadFile(ctx, url);
 
             } catch (Throwable t) {
-                XposedBridge.log(TAG + ": fetchAndDownload error: " + t);
-                showToast("Download error: " + t.getMessage());
+                XposedBridge.log(TAG + ": fetchAndDownload: " + t);
+                showToast("Download error");
             }
         });
     }
 
-    /**
-     * Makes the authenticated GET request to the Instagram private API.
-     */
     private static String fetchJson(String apiUrl, String cookie) {
         HttpURLConnection conn = null;
         try {
@@ -253,23 +282,18 @@ public class MediaDownloadButtonHook {
             conn.setRequestProperty("User-Agent",
                     "Instagram 275.0.0.27.98 Android (29/10; 420dpi; 1080x2105; "
                     + "Google/google; Pixel 4; flame; qcom; en_US; 458229237)");
-            conn.setRequestProperty("Accept",           "*/*");
-            conn.setRequestProperty("Accept-Language",  "en-US");
-            conn.setRequestProperty("X-IG-App-ID",      "567067343352427");
-            conn.setRequestProperty("X-IG-Capabilities","3brTvwE=");
+            conn.setRequestProperty("Accept",               "*/*");
+            conn.setRequestProperty("Accept-Language",      "en-US");
+            conn.setRequestProperty("X-IG-App-ID",          "567067343352427");
+            conn.setRequestProperty("X-IG-Capabilities",    "3brTvwE=");
             conn.setRequestProperty("X-IG-Connection-Type", "WIFI");
-            if (cookie != null && !cookie.isEmpty()) {
+            if (cookie != null && !cookie.isEmpty())
                 conn.setRequestProperty("Cookie", cookie);
-            }
             conn.setConnectTimeout(10000);
             conn.setReadTimeout(15000);
             conn.connect();
 
-            int code = conn.getResponseCode();
-            if (code != 200) {
-                XposedBridge.log(TAG + ": API HTTP " + code + " for " + apiUrl);
-                return null;
-            }
+            if (conn.getResponseCode() != 200) return null;
 
             StringBuilder sb = new StringBuilder();
             try (BufferedReader br = new BufferedReader(
@@ -279,106 +303,74 @@ public class MediaDownloadButtonHook {
             }
             return sb.toString();
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": fetchJson error: " + t.getMessage());
+            XposedBridge.log(TAG + ": fetchJson: " + t.getMessage());
             return null;
         } finally {
             if (conn != null) conn.disconnect();
         }
     }
 
-    /**
-     * Parses the /info/ JSON response and returns CDN URLs to download.
-     *
-     * JSON structure:
-     * {
-     *   "items": [{
-     *     "media_type": 1|2|8,
-     *     "pk": "12345",
-     *     "image_versions2": { "candidates": [{ "url": "...", "width": N, "height": N }] },
-     *     "video_versions":  [{ "url": "...", "width": N, "height": N }],
-     *     "carousel_media":  [ { same fields as above per slide } ]
-     *   }]
-     * }
-     */
     private static List<String> parseMediaUrls(String json, boolean downloadAll) {
         List<String> urls = new ArrayList<>();
         try {
-            JSONObject root = new JSONObject(json);
-            JSONArray items = root.getJSONArray("items");
+            JSONObject root  = new JSONObject(json);
+            JSONArray  items = root.getJSONArray("items");
             if (items.length() == 0) return urls;
-            JSONObject item = items.getJSONObject(0);
-            int mediaType = item.optInt("media_type", TYPE_IMAGE);
+
+            JSONObject item      = items.getJSONObject(0);
+            int        mediaType = item.optInt("media_type", TYPE_IMAGE);
 
             if (mediaType == TYPE_CAROUSEL) {
                 JSONArray carousel = item.getJSONArray("carousel_media");
-                if (downloadAll) {
-                    for (int i = 0; i < carousel.length(); i++) {
-                        String url = extractBestUrl(carousel.getJSONObject(i));
-                        if (url != null) urls.add(url);
-                    }
-                } else {
-                    // Download just the first (current) item
-                    if (carousel.length() > 0) {
-                        String url = extractBestUrl(carousel.getJSONObject(0));
-                        if (url != null) urls.add(url);
-                    }
+                int count = downloadAll ? carousel.length() : 1;
+                for (int i = 0; i < count; i++) {
+                    String url = bestUrl(carousel.getJSONObject(i));
+                    if (url != null) urls.add(url);
                 }
             } else {
-                String url = extractBestUrl(item);
+                String url = bestUrl(item);
                 if (url != null) urls.add(url);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": JSON parse error: " + t.getMessage());
+            XposedBridge.log(TAG + ": parseMediaUrls: " + t.getMessage());
         }
         return urls;
     }
 
-    /**
-     * Picks the highest-quality URL from a single media item.
-     * Prefers video_versions (has audio) over image.
-     */
-    private static String extractBestUrl(JSONObject item) {
+    private static String bestUrl(JSONObject item) {
         try {
             int type = item.optInt("media_type", TYPE_IMAGE);
-
-            // Video — use video_versions[0].url (highest quality, has audio)
+            // Video: video_versions[0].url (muxed, has audio)
             if (type == TYPE_VIDEO) {
-                JSONArray videoVersions = item.optJSONArray("video_versions");
-                if (videoVersions != null && videoVersions.length() > 0) {
-                    return videoVersions.getJSONObject(0).getString("url");
-                }
+                JSONArray vv = item.optJSONArray("video_versions");
+                if (vv != null && vv.length() > 0)
+                    return vv.getJSONObject(0).getString("url");
             }
-
-            // Image — use image_versions2.candidates[0].url (highest quality)
-            JSONObject imageVersions = item.optJSONObject("image_versions2");
-            if (imageVersions != null) {
-                JSONArray candidates = imageVersions.optJSONArray("candidates");
-                if (candidates != null && candidates.length() > 0) {
-                    return candidates.getJSONObject(0).getString("url");
-                }
+            // Image: image_versions2.candidates[0].url
+            JSONObject iv2 = item.optJSONObject("image_versions2");
+            if (iv2 != null) {
+                JSONArray cands = iv2.optJSONArray("candidates");
+                if (cands != null && cands.length() > 0)
+                    return cands.getJSONObject(0).getString("url");
             }
-
-            // Fallback: try video_versions for carousel video slides
-            JSONArray videoVersions = item.optJSONArray("video_versions");
-            if (videoVersions != null && videoVersions.length() > 0) {
-                return videoVersions.getJSONObject(0).getString("url");
-            }
-
+            // Fallback to video_versions for carousel video slides
+            JSONArray vv = item.optJSONArray("video_versions");
+            if (vv != null && vv.length() > 0)
+                return vv.getJSONObject(0).getString("url");
         } catch (Throwable ignored) {}
         return null;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // File download to gallery
+    // File download
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static void downloadFile(Context context, String urlString) {
+    private static void downloadFile(Context ctx, String urlString) {
         HttpURLConnection conn = null;
-        InputStream input = null;
+        InputStream  input  = null;
         OutputStream output = null;
         try {
-            URL url = new URL(urlString);
-            conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) new URL(urlString).openConnection();
             conn.setRequestProperty("User-Agent",
                     "Instagram 275.0.0.27.98 Android (29/10; 420dpi; 1080x2105; "
                     + "Google/google; Pixel 4; flame; qcom; en_US; 458229237)");
@@ -388,20 +380,17 @@ public class MediaDownloadButtonHook {
             conn.setInstanceFollowRedirects(true);
             conn.connect();
 
-            int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) {
-                showToast("Download failed (HTTP " + code + ")");
+            if (conn.getResponseCode() < 200 || conn.getResponseCode() >= 300) {
+                showToast("Download failed (HTTP " + conn.getResponseCode() + ")");
                 return;
             }
 
             input = conn.getInputStream();
-
-            // Detect type from Content-Type header, then URL
             String ct = conn.getContentType();
             boolean isVideo = (ct != null && ct.startsWith("video"))
                     || urlString.contains(".mp4")
                     || urlString.contains("video_versions");
-            String ext = isVideo ? ".mp4" : ".jpg";
+            String ext      = isVideo ? ".mp4" : ".jpg";
             String fileName = "InstaEclipse_" + System.currentTimeMillis()
                     + "_" + UUID.randomUUID().toString().substring(0, 8) + ext;
 
@@ -413,25 +402,19 @@ public class MediaDownloadButtonHook {
                         (isVideo ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES)
                                 + "/InstaEclipse");
                 cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
-
-                Uri col = isVideo
+                Uri col  = isVideo
                         ? MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
                         : MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
-                Uri item = context.getContentResolver().insert(col, cv);
+                Uri item = ctx.getContentResolver().insert(col, cv);
                 if (item == null) { showToast("Download failed"); return; }
-
-                output = context.getContentResolver().openOutputStream(item);
+                output = ctx.getContentResolver().openOutputStream(item);
                 if (output == null) { showToast("Download failed"); return; }
                 copy(input, output);
-
                 ContentValues done = new ContentValues();
                 done.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                context.getContentResolver().update(item, done, null, null);
+                ctx.getContentResolver().update(item, done, null, null);
             } else {
-                if (!hasLegacyPermission(context)) {
-                    showToast("Storage permission required");
-                    return;
-                }
+                if (!hasLegacyPermission(ctx)) { showToast("Storage permission required"); return; }
                 File dir = new File(Environment.getExternalStoragePublicDirectory(
                         isVideo ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES),
                         "InstaEclipse");
@@ -440,9 +423,8 @@ public class MediaDownloadButtonHook {
                 copy(input, output);
             }
             showToast("Saved ✅ " + (isVideo ? "Movies" : "Pictures") + "/InstaEclipse");
-
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": downloadFile error: " + t);
+            XposedBridge.log(TAG + ": downloadFile: " + t);
             showToast("Download failed");
         } finally {
             try { if (input  != null) input.close();  } catch (Exception ignored) {}
@@ -452,120 +434,58 @@ public class MediaDownloadButtonHook {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Media ID extraction via reflection
+    // Reflection helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Tries to extract a numeric media ID (pk) from any Instagram model object.
-     * Instagram media objects always have a "pk" or "id" field that is the media ID.
-     */
     private static String extractMediaId(Object obj) {
         if (obj == null) return null;
-        String pkg = obj.getClass().getName();
-        // Only look at Instagram model objects
-        if (!pkg.startsWith("com.instagram") && !pkg.startsWith("X.")) return null;
-
-        // Try common field names for media ID
-        for (String fieldName : new String[]{"pk", "mPk", "mId", "mediaId", "id", "mMediaId"}) {
+        for (String name : new String[]{"pk", "mPk", "mId", "mediaId", "id", "mMediaId"}) {
             try {
-                java.lang.reflect.Field f = findField(obj.getClass(), fieldName);
+                java.lang.reflect.Field f = findField(obj.getClass(), name);
                 if (f == null) continue;
                 f.setAccessible(true);
-                Object val = f.get(obj);
-                if (val == null) continue;
-                String s = val.toString().trim();
-                // Media IDs are long numeric strings (10-20 digits)
+                Object v = f.get(obj);
+                if (v == null) continue;
+                String s = v.toString().trim();
                 if (s.matches("\\d{9,20}")) return s;
             } catch (Throwable ignored) {}
         }
-
-        // Try getter methods
-        for (String methodName : new String[]{"getPk", "getMediaId", "getId", "getPkAsString"}) {
+        for (String name : new String[]{"getPk", "getMediaId", "getId", "getPkAsString"}) {
             try {
-                Method m = findMethod(obj.getClass(), methodName);
+                Method m = findMethod(obj.getClass(), name);
                 if (m == null) continue;
                 m.setAccessible(true);
-                Object val = m.invoke(obj);
-                if (val == null) continue;
-                String s = val.toString().trim();
+                Object v = m.invoke(obj);
+                if (v == null) continue;
+                String s = v.toString().trim();
                 if (s.matches("\\d{9,20}")) return s;
             } catch (Throwable ignored) {}
         }
         return null;
     }
 
-    /**
-     * Gets the media_type integer from the model object.
-     */
     private static int getMediaType(Object obj) {
         if (obj == null) return TYPE_IMAGE;
-        for (String fieldName : new String[]{"mediaType", "mMediaType", "media_type", "type"}) {
+        for (String name : new String[]{"mediaType", "mMediaType", "media_type", "type"}) {
             try {
-                java.lang.reflect.Field f = findField(obj.getClass(), fieldName);
+                java.lang.reflect.Field f = findField(obj.getClass(), name);
                 if (f == null) continue;
                 f.setAccessible(true);
-                Object val = f.get(obj);
-                if (val instanceof Integer) return (Integer) val;
+                Object v = f.get(obj);
+                if (v instanceof Integer) return (Integer) v;
             } catch (Throwable ignored) {}
         }
-        for (String methodName : new String[]{"getMediaType", "getType"}) {
+        for (String name : new String[]{"getMediaType", "getType"}) {
             try {
-                Method m = findMethod(obj.getClass(), methodName);
+                Method m = findMethod(obj.getClass(), name);
                 if (m == null) continue;
                 m.setAccessible(true);
-                Object val = m.invoke(obj);
-                if (val instanceof Integer) return (Integer) val;
+                Object v = m.invoke(obj);
+                if (v instanceof Integer) return (Integer) v;
             } catch (Throwable ignored) {}
         }
         return TYPE_IMAGE;
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Bottom sheet finder
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private static ViewGroup findBottomSheet(ViewGroup root) {
-        java.util.Queue<ViewGroup> q = new java.util.LinkedList<>();
-        q.add(root);
-        while (!q.isEmpty()) {
-            ViewGroup vg = q.poll();
-            if (isSheetCandidate(vg)) return vg;
-            for (int i = 0; i < vg.getChildCount(); i++) {
-                View c = vg.getChildAt(i);
-                if (c instanceof ViewGroup) q.add((ViewGroup) c);
-            }
-        }
-        return null;
-    }
-
-    private static boolean isSheetCandidate(ViewGroup vg) {
-        if (!(vg instanceof LinearLayout)) return false;
-        if (((LinearLayout) vg).getOrientation() != LinearLayout.VERTICAL) return false;
-        if (vg.getChildCount() < 2) return false;
-        int textCount = 0;
-        for (int i = 0; i < Math.min(vg.getChildCount(), 6); i++) {
-            if (containsText(vg.getChildAt(i))) textCount++;
-        }
-        return textCount >= 2;
-    }
-
-    private static boolean containsText(View v) {
-        if (v instanceof TextView) return true;
-        if (v instanceof ViewGroup) {
-            ViewGroup vg = (ViewGroup) v;
-            for (int i = 0; i < vg.getChildCount(); i++)
-                if (containsText(vg.getChildAt(i))) return true;
-        }
-        return false;
-    }
-
-    private static void dismissSheet(Activity a) {
-        try { a.onBackPressed(); } catch (Throwable ignored) {}
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────────────────────────────────
 
     private static java.lang.reflect.Field findField(Class<?> cls, String name) {
         while (cls != null && cls != Object.class) {
@@ -578,12 +498,19 @@ public class MediaDownloadButtonHook {
 
     private static Method findMethod(Class<?> cls, String name) {
         while (cls != null && cls != Object.class) {
-            for (Method m : cls.getDeclaredMethods()) {
+            for (Method m : cls.getDeclaredMethods())
                 if (m.getName().equals(name) && m.getParameterCount() == 0) return m;
-            }
             cls = cls.getSuperclass();
         }
         return null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Misc helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static void dismissSheet(Activity a) {
+        try { a.onBackPressed(); } catch (Throwable ignored) {}
     }
 
     private static void copy(InputStream in, OutputStream out) throws Exception {
@@ -607,11 +534,11 @@ public class MediaDownloadButtonHook {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // UI row builder
+    // Row builder
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static LinearLayout buildRow(Activity ctx, String tag,
-                                          String label, View.OnClickListener onClick) {
+    private static View buildRow(Context ctx, String tag,
+                                  String label, View.OnClickListener onClick) {
         LinearLayout row = new LinearLayout(ctx);
         row.setTag(tag);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -621,21 +548,22 @@ public class MediaDownloadButtonHook {
 
         StateListDrawable bg = new StateListDrawable();
         bg.addState(new int[]{android.R.attr.state_pressed},
-                new ColorDrawable(Color.parseColor("#40FFFFFF")));
+                new ColorDrawable(Color.parseColor("#20000000")));
         bg.addState(new int[]{}, new ColorDrawable(Color.TRANSPARENT));
         row.setBackground(bg);
 
         ImageView icon = new ImageView(ctx);
         icon.setImageDrawable(makeIcon(ctx));
         int sz = dp(ctx, 24);
-        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(sz, sz);
-        iconLp.setMarginEnd(dp(ctx, 16));
-        icon.setLayoutParams(iconLp);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(sz, sz);
+        lp.setMarginEnd(dp(ctx, 16));
+        icon.setLayoutParams(lp);
         row.addView(icon);
 
         TextView tv = new TextView(ctx);
         tv.setText(label);
-        tv.setTextColor(Color.WHITE);
+        // Match Instagram's menu text colour (dark on light sheet)
+        tv.setTextColor(Color.parseColor("#262626"));
         tv.setTextSize(16f);
         row.addView(tv);
 
@@ -648,7 +576,7 @@ public class MediaDownloadButtonHook {
         Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
         Canvas c = new Canvas(bmp);
         Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setColor(Color.WHITE);
+        p.setColor(Color.parseColor("#262626"));
         p.setStrokeWidth(dp(ctx, 2f));
         p.setStrokeCap(Paint.Cap.ROUND);
         p.setStyle(Paint.Style.STROKE);

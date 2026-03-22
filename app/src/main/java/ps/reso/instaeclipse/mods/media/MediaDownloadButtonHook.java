@@ -3,7 +3,10 @@ package ps.reso.instaeclipse.mods.media;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.AndroidAppHelper;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.pm.PackageManager;
@@ -14,8 +17,10 @@ import android.provider.MediaStore;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewTreeObserver;
 import android.view.ViewGroup;
 import android.view.ViewParent;
+import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.Toast;
@@ -41,6 +46,7 @@ import ps.reso.instaeclipse.utils.media.MediaDownloadUtils;
 
 public class MediaDownloadButtonHook {
     private static final String BUTTON_TAG = "instaeclipse_download_button";
+    private static final String FLOATING_BUTTON_TAG = "instaeclipse_download_floating_button";
     private static final Set<Integer> observedActivities = Collections.synchronizedSet(new HashSet<>());
     private static volatile String latestMediaUrl;
     private static volatile long lastClickTs;
@@ -72,6 +78,7 @@ public class MediaDownloadButtonHook {
     @SuppressLint("DiscouragedApi")
     public static void attachButtonIfNeeded(Activity activity) {
         if (activity == null || !FeatureFlags.enableMediaDownload) return;
+        boolean injected = false;
 
         int[] rowIds = new int[]{
                 activity.getResources().getIdentifier("feed_post_footer_like_button", "id", activity.getPackageName()),
@@ -88,6 +95,11 @@ public class MediaDownloadButtonHook {
             if (group == null) continue;
             if (group.findViewWithTag(BUTTON_TAG) != null) continue;
             injectDownloadButton(activity, group);
+            injected = true;
+        }
+
+        if (!injected) {
+            injectFloatingDownloadButton(activity);
         }
     }
 
@@ -95,8 +107,34 @@ public class MediaDownloadButtonHook {
         if (activity == null || !FeatureFlags.enableMediaDownload) return;
         int key = System.identityHashCode(activity);
         if (!observedActivities.add(key)) return;
+        if (activity.getWindow() == null) return;
         View decorView = activity.getWindow().getDecorView();
-        decorView.getViewTreeObserver().addOnGlobalLayoutListener(() -> attachButtonIfNeeded(activity));
+        ViewTreeObserver.OnGlobalLayoutListener listener = new ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override
+            public void onGlobalLayout() {
+                if (!FeatureFlags.enableMediaDownload) return;
+                attachButtonIfNeeded(activity);
+            }
+        };
+        decorView.getViewTreeObserver().addOnGlobalLayoutListener(listener);
+        decorView.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override
+            public void onViewAttachedToWindow(View v) {
+            }
+
+            @Override
+            public void onViewDetachedFromWindow(View v) {
+                try {
+                    if (decorView.getViewTreeObserver().isAlive()) {
+                        decorView.getViewTreeObserver().removeOnGlobalLayoutListener(listener);
+                    }
+                } catch (Throwable t) {
+                    XposedBridge.log("(InstaEclipse | MediaDownload): observer cleanup failed " + t.getMessage());
+                }
+                decorView.removeOnAttachStateChangeListener(this);
+                observedActivities.remove(key);
+            }
+        });
     }
 
     private static ViewGroup nearestHorizontalContainer(View view) {
@@ -127,23 +165,84 @@ public class MediaDownloadButtonHook {
             lp.gravity = Gravity.CENTER_VERTICAL;
             lp.setMarginStart((int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 8, activity.getResources().getDisplayMetrics()));
             button.setLayoutParams(lp);
-
-            button.setOnClickListener(v -> {
-                long now = System.currentTimeMillis();
-                if (now - lastClickTs < 1000) return;
-                lastClickTs = now;
-
-                String url = latestMediaUrl;
-                if (!MediaDownloadUtils.isSupportedMediaUrl(url)) {
-                    Toast.makeText(activity, "No downloadable media found yet", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                Toast.makeText(activity, "Downloading media...", Toast.LENGTH_SHORT).show();
-                new Thread(() -> downloadToGallery(activity.getApplicationContext(), url)).start();
-            });
+            setDownloadActions(button, activity);
             group.addView(button);
         } catch (Throwable t) {
             XposedBridge.log("(InstaEclipse | MediaDownload): inject failed " + t.getMessage());
+        }
+    }
+
+    private static void injectFloatingDownloadButton(Activity activity) {
+        try {
+            if (activity.getWindow() == null) return;
+            View decor = activity.getWindow().getDecorView();
+            if (!(decor instanceof ViewGroup root)) return;
+            if (root.findViewWithTag(FLOATING_BUTTON_TAG) != null) return;
+
+            ImageButton button = new ImageButton(activity);
+            button.setTag(FLOATING_BUTTON_TAG);
+            button.setContentDescription("Download media");
+            button.setImageResource(android.R.drawable.stat_sys_download_done);
+            button.setBackground(null);
+            int size = (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 32, activity.getResources().getDisplayMetrics());
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(size, size);
+            lp.gravity = Gravity.BOTTOM | Gravity.END;
+            int margin = (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 20, activity.getResources().getDisplayMetrics());
+            lp.bottomMargin = margin;
+            lp.setMarginEnd(margin);
+            button.setLayoutParams(lp);
+            setDownloadActions(button, activity);
+            root.addView(button);
+        } catch (Throwable t) {
+            XposedBridge.log("(InstaEclipse | MediaDownload): floating inject failed " + t.getMessage());
+        }
+    }
+
+    private static void setDownloadActions(ImageButton button, Activity activity) {
+        button.setOnClickListener(v -> startDownload(activity));
+        button.setOnLongClickListener(v -> {
+            showDownloadOptions(activity);
+            return true;
+        });
+    }
+
+    private static void startDownload(Activity activity) {
+        long now = System.currentTimeMillis();
+        if (now - lastClickTs < 1000) return;
+        lastClickTs = now;
+
+        String url = latestMediaUrl;
+        if (!MediaDownloadUtils.isSupportedMediaUrl(url)) {
+            Toast.makeText(activity, "No downloadable media found yet", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Toast.makeText(activity, "Downloading media...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> downloadToGallery(activity.getApplicationContext(), url)).start();
+    }
+
+    private static void showDownloadOptions(Activity activity) {
+        try {
+            new AlertDialog.Builder(activity)
+                    .setTitle("Media Download")
+                    .setItems(new CharSequence[]{"Download now", "Copy media URL"}, (dialog, which) -> {
+                        if (which == 0) {
+                            startDownload(activity);
+                        } else {
+                            String url = latestMediaUrl;
+                            if (!MediaDownloadUtils.isSupportedMediaUrl(url)) {
+                                Toast.makeText(activity, "No downloadable media found yet", Toast.LENGTH_SHORT).show();
+                                return;
+                            }
+                            ClipboardManager clipboard = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
+                            if (clipboard != null) {
+                                clipboard.setPrimaryClip(ClipData.newPlainText("InstaEclipse media URL", url));
+                                Toast.makeText(activity, "Media URL copied", Toast.LENGTH_SHORT).show();
+                            }
+                        }
+                    })
+                    .show();
+        } catch (Throwable t) {
+            XposedBridge.log("(InstaEclipse | MediaDownload): options dialog failed " + t.getMessage());
         }
     }
 

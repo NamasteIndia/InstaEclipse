@@ -56,7 +56,13 @@ public class Interceptor {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 try {
+                                    if (param.args == null || param.args.length == 0) {
+                                        return;
+                                    }
                                     Object requestObj = param.args[0]; // Dynamic object
+                                    if (requestObj == null) {
+                                        return;
+                                    }
                                     URI uri = (URI) XposedHelpers.getObjectField(requestObj, finalUriFieldName);
 
                                     if (uri != null && uri.getPath() != null) {
@@ -159,7 +165,7 @@ public class Interceptor {
 
                                         if (FeatureFlags.showFollowerToast && path.startsWith("/api/v1/friendships/show/")) {
                                             String[] parts = path.split("/");
-                                            if (parts.length >= 6) {
+                                            if (parts.length > 5) {
                                                 // Extracted ID from /api/v1/friendships/show/{id}
                                                 FollowIndicatorTracker.currentlyViewedUserId = parts[5];
                                             }
@@ -167,7 +173,7 @@ public class Interceptor {
 
                                     }
                                 } catch (Throwable t) {
-                                    XposedBridge.log("(InstaEclipse | Interceptor): ❌ Hook error: " + t.getMessage());
+                                    XposedBridge.log("(InstaEclipse | Interceptor): ❌ Hook error: " + t);
                                 }
                             }
                         }

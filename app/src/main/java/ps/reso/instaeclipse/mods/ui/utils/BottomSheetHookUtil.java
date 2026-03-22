@@ -18,7 +18,10 @@ import java.util.List;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.XposedHelpers;
 import ps.reso.instaeclipse.Xposed.Module;
+import ps.reso.instaeclipse.mods.media.MediaDownloadButtonHook;
+import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 import ps.reso.instaeclipse.utils.ghost.GhostModeUtils;
 
 public class BottomSheetHookUtil {
@@ -33,15 +36,11 @@ public class BottomSheetHookUtil {
                             )
             );
 
-            if (methods.isEmpty()) {
-                return;
-            }
+            if (methods.isEmpty()) return;
 
             for (MethodData method : methods) {
-                // ✅ Filter to only methods inside the InstagramMainActivity class
-                if (!method.getClassName().equals("com.instagram.mainactivity.InstagramMainActivity")) {
+                if (!method.getClassName().equals("com.instagram.mainactivity.InstagramMainActivity"))
                     continue;
-                }
 
                 Method reflectMethod;
                 try {
@@ -54,7 +53,6 @@ public class BottomSheetHookUtil {
                 String returnType = String.valueOf(method.getReturnType());
                 ClassDataList paramTypes = method.getParamTypes();
 
-                // ✅ Match: final, non-static, non-void return, 0-args
                 if (!Modifier.isStatic(modifiers)
                         && Modifier.isFinal(modifiers)
                         && !returnType.contains("void")
@@ -64,27 +62,74 @@ public class BottomSheetHookUtil {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             final Activity activity = getCurrentActivity();
-                            if (activity != null) {
-                                activity.runOnUiThread(() -> {
-                                    try {
-                                        setupHooks(activity);
-                                        addGhostEmojiNextToInbox(activity, GhostModeUtils.isGhostModeActive());
-                                    } catch (Exception ignored) {
-                                    }
-                                });
-                            }
+                            if (activity == null) return;
+                            activity.runOnUiThread(() -> {
+                                try {
+                                    setupHooks(activity);
+                                    addGhostEmojiNextToInbox(activity, GhostModeUtils.isGhostModeActive());
+                                    // Inject Download into the bottom sheet
+                                    MediaDownloadButtonHook.injectIntoBottomSheet(activity);
+                                } catch (Exception ignored) {}
+                            });
                         }
                     });
 
-                    XposedBridge.log("(InstaEclipse | BottomSheet): ✅ Hooked: " +
-                            method.getClassName() + "." + method.getName());
-                    return;
+                    XposedBridge.log("(InstaEclipse | BottomSheet): ✅ Hooked: "
+                            + method.getClassName() + "." + method.getName());
+                    break;
                 }
             }
+
+            // Also hook all BottomSheetDialogFragment.onViewCreated to catch
+            // post menus that open outside of InstagramMainActivity
+            hookAllBottomSheetDialogs(bridge);
 
         } catch (Throwable e) {
             XposedBridge.log("(InstaEclipse | BottomSheet): ❌ DexKit exception: " + e.getMessage());
         }
     }
-}
 
+    /**
+     * Hooks BottomSheetDialogFragment.onViewCreated to inject Download row
+     * into any post/reel action sheet that opens.
+     */
+    private static void hookAllBottomSheetDialogs(DexKitBridge bridge) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.google.android.material.bottomsheet.BottomSheetDialogFragment",
+                    Module.hostClassLoader,
+                    "onViewCreated",
+                    android.view.View.class,
+                    android.os.Bundle.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (!FeatureFlags.enableMediaDownload) return;
+                            Activity activity = getCurrentActivity();
+                            if (activity == null) return;
+                            activity.runOnUiThread(() ->
+                                    MediaDownloadButtonHook.injectIntoBottomSheet(activity));
+                        }
+                    });
+        } catch (Throwable ignored) {}
+
+        // Also hook androidx BottomSheetDialog.setContentView
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.google.android.material.bottomsheet.BottomSheetDialog",
+                    Module.hostClassLoader,
+                    "setContentView",
+                    android.view.View.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (!FeatureFlags.enableMediaDownload) return;
+                            Activity activity = getCurrentActivity();
+                            if (activity == null) return;
+                            activity.runOnUiThread(() ->
+                                    MediaDownloadButtonHook.injectIntoBottomSheet(activity));
+                        }
+                    });
+        } catch (Throwable ignored) {}
+    }
+}

@@ -665,7 +665,8 @@ public class DialogUtils {
                 createSwitch(context, "Disable Video Autoplay", FeatureFlags.disableVideoAutoPlay),
                 createSwitch(context, "Disable Repost", FeatureFlags.disableRepost),
                 createSwitch(context, "Show Follower Toast", FeatureFlags.showFollowerToast),
-                createSwitch(context, "Show Feature Toasts", FeatureFlags.showFeatureToasts)
+                createSwitch(context, "Show Feature Toasts", FeatureFlags.showFeatureToasts),
+                createSwitch(context, "Enable Media Download Button", FeatureFlags.enableMediaDownload)
         };
 
         // Create Enable/Disable All switch
@@ -704,6 +705,9 @@ public class DialogUtils {
                         break;
                     case 4:
                         FeatureFlags.showFeatureToasts = isChecked;
+                        break;
+                    case 5:
+                        FeatureFlags.enableMediaDownload = isChecked;
                         break;
                 }
 

@@ -29,6 +29,7 @@ import ps.reso.instaeclipse.mods.ghost.ViewOnce;
 import ps.reso.instaeclipse.mods.misc.AutoPlayDisable;
 import ps.reso.instaeclipse.mods.misc.FollowerIndicator;
 import ps.reso.instaeclipse.mods.misc.StoryFlipping;
+import ps.reso.instaeclipse.mods.media.MediaDownloadButtonHook;
 import ps.reso.instaeclipse.mods.network.Interceptor;
 import ps.reso.instaeclipse.mods.ui.UIHookManager;
 import ps.reso.instaeclipse.utils.core.CommonUtils;
@@ -254,6 +255,13 @@ public class Module implements IXposedHookLoadPackage, IXposedHookZygoteInit {
                         interceptor.handleInterceptor(lpparam);
                     } catch (Throwable ignored) {
                         XposedBridge.log("(InstaEclipse | Interceptor): ❌ Failed to hook");
+                    }
+
+                    // Media download capture & action-row button support
+                    try {
+                        new MediaDownloadButtonHook().install(lpparam);
+                    } catch (Throwable ignored) {
+                        XposedBridge.log("(InstaEclipse | MediaDownload): ❌ Failed to hook");
                     }
 
                 }

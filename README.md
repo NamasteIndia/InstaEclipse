@@ -53,6 +53,7 @@ InstaEclipse adds a settings panel inside Instagram (open it by **long-pressing 
 - Disable Auto Story Flipping.  
 - Disable Auto Play Videos.
 - Follower indicator
+- Download button beside like/comment/share to save images, videos, and reels locally.
 </details>
 
 

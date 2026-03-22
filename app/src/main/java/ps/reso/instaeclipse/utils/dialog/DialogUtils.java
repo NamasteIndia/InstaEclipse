@@ -254,8 +254,6 @@ public class DialogUtils {
                 clearAppCache(context); // Clear cache first
                 intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
                 context.startActivity(intent);
-                // Forcibly kill the current process to ensure a clean restart
-                Runtime.getRuntime().exit(0);
             } else {
                 Toast.makeText(context, "Could not find the app to restart.", Toast.LENGTH_SHORT).show();
             }
@@ -667,7 +665,8 @@ public class DialogUtils {
                 createSwitch(context, "Disable Video Autoplay", FeatureFlags.disableVideoAutoPlay),
                 createSwitch(context, "Disable Repost", FeatureFlags.disableRepost),
                 createSwitch(context, "Show Follower Toast", FeatureFlags.showFollowerToast),
-                createSwitch(context, "Show Feature Toasts", FeatureFlags.showFeatureToasts)
+                createSwitch(context, "Show Feature Toasts", FeatureFlags.showFeatureToasts),
+                createSwitch(context, "Media Download Button", FeatureFlags.enableMediaDownload)
         };
 
         // Create Enable/Disable All switch
@@ -706,6 +705,9 @@ public class DialogUtils {
                         break;
                     case 4:
                         FeatureFlags.showFeatureToasts = isChecked;
+                        break;
+                    case 5:
+                        FeatureFlags.enableMediaDownload = isChecked;
                         break;
                 }
 

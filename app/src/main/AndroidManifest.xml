@@ -26,13 +26,13 @@
 
         <activity
             android:name=".mods.devops.config.JsonImportActivity"
-            android:exported="true"
+            android:exported="false"
             android:theme="@style/Theme.InstaEclipse">
         </activity>
 
         <activity
             android:name=".mods.devops.config.JsonExportActivity"
-            android:exported="true"
+            android:exported="false"
             android:theme="@style/Theme.InstaEclipse" />
 
         <!-- Xposed Meta-data -->

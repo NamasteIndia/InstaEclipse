@@ -18,6 +18,7 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import ps.reso.instaeclipse.Xposed.Module;
 import ps.reso.instaeclipse.mods.devops.config.ConfigManager;
+import ps.reso.instaeclipse.mods.media.MediaDownloadButtonHook;
 import ps.reso.instaeclipse.mods.ui.utils.BottomSheetHookUtil;
 import ps.reso.instaeclipse.mods.ui.utils.VibrationUtil;
 import ps.reso.instaeclipse.utils.dialog.DialogUtils;
@@ -84,6 +85,8 @@ public class UIHookManager {
         }
 
         addGhostEmojiNextToInbox(activity, GhostModeUtils.isGhostModeActive());
+        MediaDownloadButtonHook.attachButtonIfNeeded(activity);
+        MediaDownloadButtonHook.ensureActivityObserver(activity);
 
         // Mark messages (DM) as seen by holding on gallery button
         hookLongPress(activity, "row_thread_composer_button_gallery", v -> {

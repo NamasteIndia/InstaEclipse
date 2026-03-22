@@ -20,129 +20,101 @@ import ps.reso.instaeclipse.utils.feature.FeatureStatusTracker;
 
 public class DevOptionsEnable {
 
-    // Stable unique strings that identify the download-eligibility class (LX/515)
-    // Confirmed from Instagram 421 APK smali analysis:
-    //   LX/515->A0A(UserSession, Media) -> Z  gates MediaOption$Option.DOWNLOAD
-    //   LX/515->A06(UserSession, Z)     -> Z  is a second gate in the Reels path
-    private static final String DOWNLOAD_GATE_STRING_1 = "is_third_party_downloads_eligible";
-    private static final String DOWNLOAD_GATE_STRING_2 = "is_clips_downloadable";
-
     public void handleDevOptions(DexKitBridge bridge) {
         try {
-            // Hook 1: original dev-options gate (is_employee class)
             findAndHookDynamicMethod(bridge);
-
-            // Hook 2: download eligibility gate (LX/515)
             hookDownloadEligibility(bridge);
-
         } catch (Exception e) {
-            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ Error: " + e.getMessage());
+            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ " + e.getMessage());
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Hook 2 — Download eligibility gate
+    // Hook: Download eligibility gate
     //
-    // Instagram's menu builder (X/6Dd, X/6Db) calls:
-    //   LX/515->A0A(UserSession, Media) -> Z
-    // If it returns TRUE, MediaOption$Option.DOWNLOAD is added to the menu list.
-    // Instagram already has the Download row built-in — it's just gated here.
+    // From Instagram 421 APK smali analysis (X/6Dd.smali:5233, X/6Db.smali:3002):
     //
-    // We find LX/515 via its unique strings "is_third_party_downloads_eligible"
-    // and "is_clips_downloadable" (confirmed stable across versions from APK analysis).
-    // Then we hook ALL (UserSession, ...) -> Z methods in that class to return true,
-    // which enables the native Download option unconditionally.
+    //   sget-object v2, LX/515;->A00:LX/515;
+    //   invoke-virtual {v2, v14, v3}, LX/515;->A0A(UserSession, Media) -> Z
+    //   if-eqz v2, :skip_download
+    //   sget-object v2, MediaOption$Option->DOWNLOAD
+    //   list.add(v2)   <-- Instagram adds its own native Download row
+    //
+    // We hook ONLY A0A(UserSession, Media) -> Z to return true.
+    // This is safe — it's only called in the menu option builder methods.
+    // All other LX/515 methods are left untouched to prevent crashes.
     // ─────────────────────────────────────────────────────────────────────────
     private void hookDownloadEligibility(DexKitBridge bridge) {
         try {
-            // Find the download-eligibility class via its unique string constants
+            // Find LX/515 via its unique string constant
             List<ClassData> classes = bridge.findClass(
                     FindClass.create().matcher(
                             ClassMatcher.create()
-                                    .usingStrings(DOWNLOAD_GATE_STRING_1)
+                                    .usingStrings("is_third_party_downloads_eligible")
                     )
             );
 
-            // Fallback: try second unique string if first not found
             if (classes.isEmpty()) {
+                // Fallback string
                 classes = bridge.findClass(
                         FindClass.create().matcher(
                                 ClassMatcher.create()
-                                        .usingStrings(DOWNLOAD_GATE_STRING_2)
+                                        .usingStrings("is_clips_downloadable")
                         )
                 );
             }
 
             if (classes.isEmpty()) {
-                XposedBridge.log("(InstaEclipse | DownloadGate): ❌ eligibility class not found");
+                XposedBridge.log("(InstaEclipse | DownloadGate): ❌ class not found");
                 return;
             }
 
             for (ClassData classData : classes) {
                 String className = classData.getName();
-                XposedBridge.log("(InstaEclipse | DownloadGate): found class → " + className);
+                XposedBridge.log("(InstaEclipse | DownloadGate): found → " + className);
 
-                // Hook all boolean methods that take UserSession as first param
-                // This covers:
-                //   A0A(UserSession, Media) -> Z  — feed post download gate
-                //   A04(UserSession)        -> Z  — simple eligibility check
-                //   A06(UserSession, Z)     -> Z  — Reels second gate (needs false, handled below)
+                // Find ONLY A0A(UserSession, Media) -> Z
+                // Exact param types confirmed from DEX binary parsing of all Instagram dex files
                 List<MethodData> methods = bridge.findMethod(
                         FindMethod.create().matcher(
                                 MethodMatcher.create()
                                         .declaredClass(className)
                                         .returnType("boolean")
+                                        .paramTypes(
+                                            "com.instagram.common.session.UserSession",
+                                            "com.instagram.feed.media.Media"
+                                        )
                         )
                 );
 
-                XposedBridge.log("(InstaEclipse | DownloadGate): found " + methods.size()
-                        + " boolean methods in " + className);
+                if (methods.isEmpty()) {
+                    XposedBridge.log("(InstaEclipse | DownloadGate): ❌ A0A not found in "
+                            + className);
+                    continue;
+                }
 
                 for (MethodData md : methods) {
-                    hookDownloadGateMethod(md, className);
+                    try {
+                        Method m = md.getMethodInstance(Module.hostClassLoader);
+                        XposedBridge.hookMethod(m, new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                if (!FeatureFlags.enableMediaDownload) return;
+                                param.setResult(true);
+                            }
+                        });
+                        XposedBridge.log("(InstaEclipse | DownloadGate): ✅ hooked "
+                                + className + "." + md.getName()
+                                + "(UserSession, Media) -> Z");
+                    } catch (Throwable t) {
+                        XposedBridge.log("(InstaEclipse | DownloadGate): ❌ hook failed: "
+                                + t.getMessage());
+                    }
                 }
             }
 
         } catch (Throwable t) {
             XposedBridge.log("(InstaEclipse | DownloadGate): ❌ " + t.getMessage());
-        }
-    }
-
-    private void hookDownloadGateMethod(MethodData md, String className) {
-        try {
-            Method m = md.getMethodInstance(Module.hostClassLoader);
-
-            // Determine what this method should return:
-            // A06(UserSession, Z) -> Z is the Reels "already-enabled" check.
-            // if-nez result, :skip_download — so it must return FALSE to show download.
-            // All other boolean methods in this class should return TRUE.
-            //
-            // We identify A06-style methods as: returns Z, first param is UserSession,
-            // second param is Z (boolean). These must return false.
-            boolean mustReturnFalse = false;
-            Class<?>[] params = m.getParameterTypes();
-            if (params.length == 2
-                    && params[1] == Boolean.TYPE
-                    && params[0].getName().contains("UserSession")) {
-                mustReturnFalse = true;
-            }
-
-            final boolean returnValue = !mustReturnFalse;
-
-            XposedBridge.hookMethod(m, new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!FeatureFlags.enableMediaDownload) return;
-                    param.setResult(returnValue);
-                }
-            });
-
-            XposedBridge.log("(InstaEclipse | DownloadGate): ✅ hooked "
-                    + md.getName() + " → always returns " + returnValue);
-
-        } catch (Throwable t) {
-            XposedBridge.log("(InstaEclipse | DownloadGate): ❌ hook failed for "
-                    + md.getName() + ": " + t.getMessage());
         }
     }
 
@@ -154,7 +126,6 @@ public class DevOptionsEnable {
             List<ClassData> classes = bridge.findClass(FindClass.create()
                     .matcher(ClassMatcher.create().usingStrings("is_employee"))
             );
-
             if (classes.isEmpty()) return;
 
             for (ClassData classData : classes) {
@@ -166,7 +137,6 @@ public class DevOptionsEnable {
                                 .declaredClass(className)
                                 .usingStrings("is_employee"))
                 );
-
                 if (methods.isEmpty()) continue;
 
                 for (MethodData method : methods) {
@@ -174,8 +144,7 @@ public class DevOptionsEnable {
                 }
             }
         } catch (Exception e) {
-            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ Error during discovery: "
-                    + e.getMessage());
+            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ " + e.getMessage());
         }
     }
 
@@ -196,15 +165,13 @@ public class DevOptionsEnable {
                 if (paramTypes.size() == 1
                         && paramTypes.get(0).contains("com.instagram.common.session.UserSession")) {
                     String targetClass = invokedMethod.getClassName();
-                    XposedBridge.log("(InstaEclipse | DevOptionsEnable): 📦 Hooking boolean methods in: "
-                            + targetClass);
+                    XposedBridge.log("(InstaEclipse | DevOptionsEnable): 📦 Hooking: " + targetClass);
                     hookAllBooleanMethodsInClass(bridge, targetClass);
                     return;
                 }
             }
         } catch (Exception e) {
-            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ Error inspecting: "
-                    + e.getMessage());
+            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ " + e.getMessage());
         }
     }
 
@@ -235,17 +202,16 @@ public class DevOptionsEnable {
                                 }
                             }
                         });
-                        XposedBridge.log("(InstaEclipse | DevOptionsEnable): ✅ Hooked: "
+                        XposedBridge.log("(InstaEclipse | DevOptionsEnable): ✅ "
                                 + method.getClassName() + "." + method.getName());
                     } catch (Throwable e) {
-                        XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ Failed to hook "
+                        XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ "
                                 + method.getName() + ": " + e.getMessage());
                     }
                 }
             }
         } catch (Exception e) {
-            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ Error while hooking class: "
-                    + className + " → " + e.getMessage());
+            XposedBridge.log("(InstaEclipse | DevOptionsEnable): ❌ " + e.getMessage());
         }
     }
 }

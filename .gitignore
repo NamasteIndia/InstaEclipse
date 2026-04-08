@@ -18,3 +18,6 @@ local.properties
 /app/debug
 /.claude
 /APK
+*.apk
+*.apks
+/apk_tmp/

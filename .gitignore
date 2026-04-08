@@ -21,3 +21,6 @@ local.properties
 *.apk
 *.apks
 /apk_tmp/
+/tools/
+/ig422_dec/
+/ig422_res/

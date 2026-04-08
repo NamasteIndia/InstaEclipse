@@ -22,6 +22,7 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import ps.reso.instaeclipse.Xposed.Module;
 import ps.reso.instaeclipse.mods.devops.config.ConfigManager;
+import ps.reso.instaeclipse.mods.media.PostActionDownloadButton;
 import ps.reso.instaeclipse.mods.ui.utils.BottomSheetHookUtil;
 import ps.reso.instaeclipse.mods.ui.utils.VibrationUtil;
 import ps.reso.instaeclipse.utils.dialog.DialogUtils;
@@ -88,6 +89,9 @@ public class UIHookManager {
         }
 
         addGhostEmojiNextToInbox(activity, GhostModeUtils.isGhostModeActive());
+        PostActionDownloadButton.scanAndInject(activity);
+        new Handler(Looper.getMainLooper()).postDelayed(() -> PostActionDownloadButton.scanAndInject(activity), 800);
+        new Handler(Looper.getMainLooper()).postDelayed(() -> PostActionDownloadButton.scanAndInject(activity), 1800);
 
         // Mark messages (DM) as seen by holding on gallery button
         hookLongPress(activity, "row_thread_composer_button_gallery", v -> {
@@ -188,6 +192,7 @@ public class UIHookManager {
                             try {
                                 // 1. Initialize Hooks
                                 setupHooks(activity);
+                                PostActionDownloadButton.scanAndInject(activity);
 
                                 // 2. Delay UI injections slightly.
                                 // Instagram's Main is complex; the Inbox/UI might not be inflated immediately.
@@ -195,6 +200,7 @@ public class UIHookManager {
                                     try {
                                         // Add the Ghost Emoji next to Inbox
                                         addGhostEmojiNextToInbox(activity, isAnyGhostOptionEnabled());
+                                        PostActionDownloadButton.scanAndInject(activity);
 
                                         // Handle Config Import if triggered
                                         if (FeatureFlags.isImportingConfig) {
@@ -264,6 +270,7 @@ public class UIHookManager {
                         activity.runOnUiThread(() -> {
                             try {
                                 setupHooks(activity);
+                                PostActionDownloadButton.scanAndInject(activity);
                                 addGhostEmojiNextToInbox(activity, isAnyGhostOptionEnabled());
                                 if (FeatureFlags.isImportingConfig) {
                                     FeatureFlags.isImportingConfig = false;
@@ -294,6 +301,7 @@ public class UIHookManager {
                     activity.runOnUiThread(() -> {
                         try {
                             setupHooks(activity);
+                            PostActionDownloadButton.scanAndInject(activity);
                         } catch (Exception ignored) {
                         }
                     });

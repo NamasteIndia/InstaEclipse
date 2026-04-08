@@ -66,6 +66,30 @@ public class DialogUtils {
         }
     }
 
+    public static void showMediaDownloadOptionsDialog(Context context) {
+        if (context == null) return;
+        String[] items = new String[]{
+                "Download Current Media",
+                "Download All Recent Media",
+                "Cancel"
+        };
+        try {
+            new AlertDialog.Builder(context)
+                    .setTitle("Media Downloader")
+                    .setItems(items, (dialog, which) -> {
+                        if (which == 0) {
+                            MediaDownloadManager.downloadCurrentMedia(context);
+                        } else if (which == 1) {
+                            MediaDownloadManager.downloadAllRecentMedia(context);
+                        } else {
+                            dialog.dismiss();
+                        }
+                    })
+                    .show();
+        } catch (Exception ignored) {
+        }
+    }
+
     @SuppressLint("SetTextI18n")
     private static LinearLayout buildMainMenuLayout(Context context) {
         LinearLayout mainLayout = new LinearLayout(context);

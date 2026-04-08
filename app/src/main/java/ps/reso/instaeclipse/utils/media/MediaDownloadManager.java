@@ -11,18 +11,15 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.atomic.AtomicReference;
 
 import de.robv.android.xposed.XposedBridge;
 import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 
 public class MediaDownloadManager {
 
-    private static final AtomicReference<String> lastCapturedMediaUrl = new AtomicReference<>();
     private static final Object lock = new Object();
     private static final int MAX_RECENT_MEDIA = 25;
     private static final LinkedHashSet<String> recentMediaUrls = new LinkedHashSet<>();
-    private static volatile int lastCapturedScore = -1;
 
     private MediaDownloadManager() {
         // Utility class
@@ -37,12 +34,6 @@ public class MediaDownloadManager {
         int score = scoreCandidate(lower);
         if (score <= 0) {
             return;
-        }
-
-        // Keep the best candidate to avoid picking audio-only streams.
-        if (score > lastCapturedScore) {
-            lastCapturedMediaUrl.set(url);
-            lastCapturedScore = score;
         }
 
         synchronized (lock) {
@@ -65,7 +56,7 @@ public class MediaDownloadManager {
             return false;
         }
 
-        String url = lastCapturedMediaUrl.get();
+        String url = pickBestRecentCandidate();
         if (url == null || url.isEmpty()) {
             Toast.makeText(context, "No media URL captured yet.", Toast.LENGTH_SHORT).show();
             return false;
@@ -85,9 +76,6 @@ public class MediaDownloadManager {
 
             enqueueDownload(dm, context, url);
             Toast.makeText(context, "Download started.", Toast.LENGTH_SHORT).show();
-
-            // Reset score so next capture can replace old content naturally.
-            lastCapturedScore = -1;
             return true;
         } catch (Exception e) {
             XposedBridge.log("InstaEclipse | Media download failed: " + e.getMessage());
@@ -189,16 +177,37 @@ public class MediaDownloadManager {
             return 0;
         }
 
+        // De-prioritize probable video-only adaptive segment paths.
+        int score = 0;
+        if (lowerUrl.contains("/vp/")) score += 15;
+        if (lowerUrl.contains("/v/t")) score += 25;
+        if (lowerUrl.contains("bytestart=") || lowerUrl.contains("byteend=")) score -= 20;
+
         // Strong signals for directly downloadable video/image assets.
-        if (lowerUrl.contains(".mp4")) return 100;
+        if (lowerUrl.contains(".mp4")) score += 70;
         if (lowerUrl.contains(".jpg") || lowerUrl.contains(".jpeg") || lowerUrl.contains(".png") || lowerUrl.contains(".webp")) return 95;
 
         // Medium confidence: IG CDN video path hints.
         if ((lowerUrl.contains("cdninstagram") || lowerUrl.contains("fbcdn"))
                 && (lowerUrl.contains("/vp/") || lowerUrl.contains("/v/"))) {
-            return 60;
+            score += 10;
         }
 
-        return 0;
+        return Math.max(score, 0);
+    }
+
+    private static String pickBestRecentCandidate() {
+        synchronized (lock) {
+            String bestUrl = null;
+            int bestScore = -1;
+            for (String candidate : recentMediaUrls) {
+                int s = scoreCandidate(candidate.toLowerCase(Locale.ROOT));
+                if (s > bestScore) {
+                    bestScore = s;
+                    bestUrl = candidate;
+                }
+            }
+            return bestUrl;
+        }
     }
 }

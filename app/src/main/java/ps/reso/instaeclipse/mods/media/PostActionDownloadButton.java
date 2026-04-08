@@ -48,7 +48,16 @@ public class PostActionDownloadButton {
         @SuppressLint("DiscouragedApi") int sendId = ctx.getResources().getIdentifier("row_feed_button_send", "id", ctx.getPackageName());
 
         int id = view.getId();
-        return id != View.NO_ID && (id == likeId || id == commentId || id == shareId || id == sendId);
+        if (id != View.NO_ID && (id == likeId || id == commentId || id == shareId || id == sendId)) {
+            return true;
+        }
+
+        CharSequence desc = view.getContentDescription();
+        if (desc != null) {
+            String d = desc.toString().toLowerCase();
+            return d.contains("like") || d.contains("comment") || d.contains("share") || d.contains("send");
+        }
+        return false;
     }
 
     private boolean looksLikeActionBarContainer(ViewGroup container, Context ctx) {
@@ -62,7 +71,23 @@ public class PostActionDownloadButton {
         if (commentId != 0 && container.findViewById(commentId) != null) matchCount++;
         if (shareId != 0 && container.findViewById(shareId) != null) matchCount++;
         if (sendId != 0 && container.findViewById(sendId) != null) matchCount++;
-        return matchCount >= 2;
+        if (matchCount >= 2) return true;
+
+        // Fallback for obfuscated builds/localized labels.
+        int clickableImageButtons = 0;
+        int clueCount = 0;
+        for (int i = 0; i < container.getChildCount(); i++) {
+            View child = container.getChildAt(i);
+            if (child instanceof ImageButton && child.isClickable()) clickableImageButtons++;
+            CharSequence desc = child.getContentDescription();
+            if (desc != null) {
+                String d = desc.toString().toLowerCase();
+                if (d.contains("like") || d.contains("comment") || d.contains("share") || d.contains("send")) {
+                    clueCount++;
+                }
+            }
+        }
+        return clickableImageButtons >= 3 || clueCount >= 2;
     }
 
     private void injectDownloadButton(ViewGroup actionBar, Context ctx) {
@@ -75,9 +100,16 @@ public class PostActionDownloadButton {
         btn.setBackground(null);
         btn.setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 6), dp(ctx, 6));
 
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(ctx, 34), dp(ctx, 34));
-        lp.setMarginStart(dp(ctx, 6));
-        btn.setLayoutParams(lp);
+        ViewGroup.LayoutParams existing = actionBar.getLayoutParams();
+        if (existing instanceof LinearLayout.LayoutParams) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(ctx, 34), dp(ctx, 34));
+            lp.setMarginStart(dp(ctx, 6));
+            btn.setLayoutParams(lp);
+        } else {
+            ViewGroup.MarginLayoutParams lp = new ViewGroup.MarginLayoutParams(dp(ctx, 34), dp(ctx, 34));
+            lp.setMarginStart(dp(ctx, 6));
+            btn.setLayoutParams(lp);
+        }
 
         btn.setOnClickListener(v -> MediaDownloadManager.downloadCurrentMedia(ctx));
         btn.setOnLongClickListener(v -> {
@@ -87,7 +119,7 @@ public class PostActionDownloadButton {
 
         actionBar.post(() -> {
             try {
-                actionBar.addView(btn);
+                actionBar.addView(btn, Math.min(3, actionBar.getChildCount()));
                 btn.bringToFront();
             } catch (Throwable ignored) {
             }

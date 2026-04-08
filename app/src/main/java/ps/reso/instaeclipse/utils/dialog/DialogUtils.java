@@ -32,6 +32,7 @@ import ps.reso.instaeclipse.mods.ui.UIHookManager;
 import ps.reso.instaeclipse.utils.core.SettingsManager;
 import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 import ps.reso.instaeclipse.utils.ghost.GhostModeUtils;
+import ps.reso.instaeclipse.utils.media.MediaDownloadManager;
 
 public class DialogUtils {
 
@@ -666,6 +667,7 @@ public class DialogUtils {
                 createSwitch(context, "Disable Story Auto-Swipe", FeatureFlags.disableStoryFlipping),
                 createSwitch(context, "Disable Video Autoplay", FeatureFlags.disableVideoAutoPlay),
                 createSwitch(context, "Disable Repost", FeatureFlags.disableRepost),
+                createSwitch(context, "Enable Media Downloader (Beta)", FeatureFlags.enableMediaDownload),
                 createSwitch(context, "Show Follower Toast", FeatureFlags.showFollowerToast),
                 createSwitch(context, "Show Feature Toasts", FeatureFlags.showFeatureToasts)
         };
@@ -702,9 +704,12 @@ public class DialogUtils {
                         FeatureFlags.disableRepost = isChecked;
                         break;
                     case 3:
-                        FeatureFlags.showFollowerToast = isChecked;
+                        FeatureFlags.enableMediaDownload = isChecked;
                         break;
                     case 4:
+                        FeatureFlags.showFollowerToast = isChecked;
+                        break;
+                    case 5:
                         FeatureFlags.showFeatureToasts = isChecked;
                         break;
                 }
@@ -721,6 +726,12 @@ public class DialogUtils {
         for (Switch s : switches) {
             layout.addView(s);
         }
+        layout.addView(createDivider(context));
+        layout.addView(createClickableSection(context, "⬇ Download Last Seen Media", () -> {
+            Activity activity = UIHookManager.getCurrentActivity();
+            Context safeContext = activity != null ? activity : context;
+            MediaDownloadManager.downloadLastCapturedMedia(safeContext);
+        }));
 
         // Show dialog
         showSectionDialog(context, "Miscellaneous ⚙️", layout, () -> {

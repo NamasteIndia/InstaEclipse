@@ -58,6 +58,7 @@ public class SettingsManager {
         editor.putBoolean("disableStoryFlipping", FeatureFlags.disableStoryFlipping);
         editor.putBoolean("disableVideoAutoPlay", FeatureFlags.disableVideoAutoPlay);
         editor.putBoolean("disableRepost", FeatureFlags.disableRepost);
+        editor.putBoolean("enableMediaDownload", FeatureFlags.enableMediaDownload);
         editor.putBoolean("showFollowerToast", FeatureFlags.showFollowerToast);
         editor.putBoolean("showFeatureToasts", FeatureFlags.showFeatureToasts);
 
@@ -110,6 +111,7 @@ public class SettingsManager {
         FeatureFlags.disableStoryFlipping = prefs.getBoolean("disableStoryFlipping", false);
         FeatureFlags.disableVideoAutoPlay = prefs.getBoolean("disableVideoAutoPlay", false);
         FeatureFlags.disableRepost = prefs.getBoolean("disableRepost", false);
+        FeatureFlags.enableMediaDownload = prefs.getBoolean("enableMediaDownload", false);
         FeatureFlags.showFollowerToast = prefs.getBoolean("showFollowerToast", false);
         FeatureFlags.showFeatureToasts = prefs.getBoolean("showFeatureToasts", false);
 

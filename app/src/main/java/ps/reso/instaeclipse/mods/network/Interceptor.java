@@ -10,6 +10,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 import ps.reso.instaeclipse.utils.feature.FeatureStatusTracker;
+import ps.reso.instaeclipse.utils.media.MediaDownloadManager;
 import ps.reso.instaeclipse.utils.tracker.FollowIndicatorTracker;
 
 public class Interceptor {
@@ -59,6 +60,8 @@ public class Interceptor {
                                 URI uri = (URI) XposedHelpers.getObjectField(requestObj, finalUriFieldName);
 
                                 if (uri != null && uri.getPath() != null) {
+                                    // Capture media-like URLs for on-demand download feature.
+                                    MediaDownloadManager.captureCandidateUrl(uri.toString());
                                     // Check all conditions passed in as predicates
                                     boolean shouldDrop = false;
 

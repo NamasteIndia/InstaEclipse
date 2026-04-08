@@ -59,5 +59,11 @@ public class FeatureManager {
         } else {
             FeatureStatusTracker.setDisabled("DisableTrackingLinks");
         }
+
+        if (FeatureFlags.enableMediaDownload) {
+            FeatureStatusTracker.setEnabled("MediaDownloader");
+        } else {
+            FeatureStatusTracker.setDisabled("MediaDownloader");
+        }
     }
 }

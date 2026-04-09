@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Context;
 import android.graphics.Color;
+import android.util.TypedValue;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageButton;
@@ -12,6 +13,7 @@ import android.widget.LinearLayout;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
+import ps.reso.instaeclipse.utils.core.SettingsManager;
 import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 import ps.reso.instaeclipse.utils.media.MediaDownloadManager;
 
@@ -58,7 +60,9 @@ public class PostActionDownloadButton {
     }
 
     public static void scanAndInject(Activity activity) {
-        if (activity == null || !FeatureFlags.enableMediaDownload) return;
+        if (activity == null) return;
+        SettingsManager.loadAllFlags(activity);
+        if (!FeatureFlags.enableMediaDownload) return;
         PostActionDownloadButton helper = new PostActionDownloadButton();
         helper.ensureKnownIds(activity);
         helper.injectKnownContainers(activity);
@@ -124,7 +128,8 @@ public class PostActionDownloadButton {
         ImageButton btn = new ImageButton(ctx);
         btn.setTag(BTN_TAG);
         btn.setImageResource(android.R.drawable.stat_sys_download_done);
-        btn.setColorFilter(Color.WHITE);
+        btn.setColorFilter(actionBarIconTint(ctx));
+        btn.setContentDescription("Download");
         btn.setBackground(null);
         btn.setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 6), dp(ctx, 6));
 
@@ -156,6 +161,15 @@ public class PostActionDownloadButton {
 
     private int dp(Context ctx, int value) {
         return (int) (value * ctx.getResources().getDisplayMetrics().density);
+    }
+
+    /** Match feed action icons (visible on both light and dark Instagram themes). */
+    private int actionBarIconTint(Context ctx) {
+        TypedValue tv = new TypedValue();
+        if (ctx.getTheme().resolveAttribute(android.R.attr.textColorPrimary, tv, true)) {
+            return tv.data;
+        }
+        return Color.WHITE;
     }
 
     private void injectKnownContainers(Activity activity) {

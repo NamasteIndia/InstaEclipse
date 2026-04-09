@@ -10,13 +10,69 @@ public class SettingsManager {
     private static final String PREF_NAME = "instaeclipse_prefs";
     private static SharedPreferences prefs;
 
+    /**
+     * Writable prefs for the InstaEclipse app only. When hooks run inside Instagram,
+     * {@code context.getSharedPreferences} would read/write the host app's data dir, so we only
+     * cache prefs from our own package here.
+     */
     public static void init(Context context) {
-        if (prefs == null) {
-            prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+        if (prefs != null) {
+            return;
+        }
+        if (CommonUtils.MY_PACKAGE_NAME.equals(context.getPackageName())) {
+            prefs = context.getApplicationContext().getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+        }
+    }
+
+    /**
+     * Opens the module's preferences while running inside another app (e.g. Instagram under Xposed).
+     * Uses reflection so the InstaEclipse APK does not need to embed the Xposed API at runtime.
+     */
+    private static SharedPreferences readablePrefsForLoad(Context context) {
+        if (CommonUtils.MY_PACKAGE_NAME.equals(context.getPackageName())) {
+            if (prefs == null) {
+                init(context);
+            }
+            return prefs;
+        }
+        try {
+            Class<?> xspClass = Class.forName("de.robv.android.xposed.XSharedPreferences");
+            Object xp = xspClass.getConstructor(String.class, String.class)
+                    .newInstance(CommonUtils.MY_PACKAGE_NAME, PREF_NAME);
+            xspClass.getMethod("reload").invoke(xp);
+            return (SharedPreferences) xp;
+        } catch (Throwable ignored) {
+        }
+        try {
+            Context moduleCtx = context.createPackageContext(
+                    CommonUtils.MY_PACKAGE_NAME,
+                    Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY);
+            return moduleCtx.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+        } catch (Throwable ignored) {
+        }
+        return context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+    }
+
+    private static void ensureWritablePrefsForSave() {
+        if (prefs != null) {
+            return;
+        }
+        try {
+            Class<?> helper = Class.forName("de.robv.android.xposed.AndroidAppHelper");
+            Context app = (Context) helper.getMethod("currentApplication").invoke(null);
+            Context moduleCtx = app.createPackageContext(
+                    CommonUtils.MY_PACKAGE_NAME,
+                    Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY);
+            prefs = moduleCtx.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
+        } catch (Throwable ignored) {
         }
     }
 
     public static void saveAllFlags() {
+        ensureWritablePrefsForSave();
+        if (prefs == null) {
+            return;
+        }
         SharedPreferences.Editor editor = prefs.edit();
 
         editor.putBoolean("isDevEnabled", FeatureFlags.isDevEnabled);
@@ -68,52 +124,50 @@ public class SettingsManager {
     }
 
     public static void loadAllFlags(Context context) {
-        if (prefs == null) {
-            prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
-        }
+        SharedPreferences sp = readablePrefsForLoad(context);
 
-        FeatureFlags.isDevEnabled = prefs.getBoolean("isDevEnabled", false);
+        FeatureFlags.isDevEnabled = sp.getBoolean("isDevEnabled", false);
 
         // Ghost Mode
-        FeatureFlags.isGhostModeEnabled = prefs.getBoolean("isGhostModeEnabled", false);
-        FeatureFlags.isGhostSeen = prefs.getBoolean("isGhostSeen", false);
-        FeatureFlags.isGhostTyping = prefs.getBoolean("isGhostTyping", false);
-        FeatureFlags.isGhostScreenshot = prefs.getBoolean("isGhostScreenshot", false);
-        FeatureFlags.isGhostViewOnce = prefs.getBoolean("isGhostViewOnce", false);
-        FeatureFlags.isGhostStory = prefs.getBoolean("isGhostStory", false);
-        FeatureFlags.isGhostLive = prefs.getBoolean("isGhostLive", false);
+        FeatureFlags.isGhostModeEnabled = sp.getBoolean("isGhostModeEnabled", false);
+        FeatureFlags.isGhostSeen = sp.getBoolean("isGhostSeen", false);
+        FeatureFlags.isGhostTyping = sp.getBoolean("isGhostTyping", false);
+        FeatureFlags.isGhostScreenshot = sp.getBoolean("isGhostScreenshot", false);
+        FeatureFlags.isGhostViewOnce = sp.getBoolean("isGhostViewOnce", false);
+        FeatureFlags.isGhostStory = sp.getBoolean("isGhostStory", false);
+        FeatureFlags.isGhostLive = sp.getBoolean("isGhostLive", false);
 
         // Quick Toggles
-        FeatureFlags.quickToggleSeen = prefs.getBoolean("quickToggleSeen", false);
-        FeatureFlags.quickToggleTyping = prefs.getBoolean("quickToggleTyping", false);
-        FeatureFlags.quickToggleScreenshot = prefs.getBoolean("quickToggleScreenshot", false);
-        FeatureFlags.quickToggleViewOnce = prefs.getBoolean("quickToggleViewOnce", false);
-        FeatureFlags.quickToggleStory = prefs.getBoolean("quickToggleStory", false);
-        FeatureFlags.quickToggleLive = prefs.getBoolean("quickToggleLive", false);
+        FeatureFlags.quickToggleSeen = sp.getBoolean("quickToggleSeen", false);
+        FeatureFlags.quickToggleTyping = sp.getBoolean("quickToggleTyping", false);
+        FeatureFlags.quickToggleScreenshot = sp.getBoolean("quickToggleScreenshot", false);
+        FeatureFlags.quickToggleViewOnce = sp.getBoolean("quickToggleViewOnce", false);
+        FeatureFlags.quickToggleStory = sp.getBoolean("quickToggleStory", false);
+        FeatureFlags.quickToggleLive = sp.getBoolean("quickToggleLive", false);
 
         // Distraction Free
-        FeatureFlags.isExtremeMode = prefs.getBoolean("isExtremeMode", false);
-        FeatureFlags.isDistractionFree = prefs.getBoolean("isDistractionFree", false);
-        FeatureFlags.disableStories = prefs.getBoolean("disableStories", false);
-        FeatureFlags.disableFeed = prefs.getBoolean("disableFeed", false);
-        FeatureFlags.disableReels = prefs.getBoolean("disableReels", false);
-        FeatureFlags.disableReelsExceptDM = prefs.getBoolean("disableReelsExceptDM", false);
-        FeatureFlags.disableExplore = prefs.getBoolean("disableExplore", false);
-        FeatureFlags.disableComments = prefs.getBoolean("disableComments", false);
+        FeatureFlags.isExtremeMode = sp.getBoolean("isExtremeMode", false);
+        FeatureFlags.isDistractionFree = sp.getBoolean("isDistractionFree", false);
+        FeatureFlags.disableStories = sp.getBoolean("disableStories", false);
+        FeatureFlags.disableFeed = sp.getBoolean("disableFeed", false);
+        FeatureFlags.disableReels = sp.getBoolean("disableReels", false);
+        FeatureFlags.disableReelsExceptDM = sp.getBoolean("disableReelsExceptDM", false);
+        FeatureFlags.disableExplore = sp.getBoolean("disableExplore", false);
+        FeatureFlags.disableComments = sp.getBoolean("disableComments", false);
 
         // Ads
-        FeatureFlags.isAdBlockEnabled = prefs.getBoolean("isAdBlockEnabled", false);
-        FeatureFlags.isAnalyticsBlocked = prefs.getBoolean("isAnalyticsBlocked", false);
-        FeatureFlags.disableTrackingLinks = prefs.getBoolean("disableTrackingLinks", false);
+        FeatureFlags.isAdBlockEnabled = sp.getBoolean("isAdBlockEnabled", false);
+        FeatureFlags.isAnalyticsBlocked = sp.getBoolean("isAnalyticsBlocked", false);
+        FeatureFlags.disableTrackingLinks = sp.getBoolean("disableTrackingLinks", false);
 
         // Misc
-        FeatureFlags.isMiscEnabled = prefs.getBoolean("isMiscEnabled", false);
-        FeatureFlags.disableStoryFlipping = prefs.getBoolean("disableStoryFlipping", false);
-        FeatureFlags.disableVideoAutoPlay = prefs.getBoolean("disableVideoAutoPlay", false);
-        FeatureFlags.disableRepost = prefs.getBoolean("disableRepost", false);
-        FeatureFlags.enableMediaDownload = prefs.getBoolean("enableMediaDownload", false);
-        FeatureFlags.showFollowerToast = prefs.getBoolean("showFollowerToast", false);
-        FeatureFlags.showFeatureToasts = prefs.getBoolean("showFeatureToasts", false);
+        FeatureFlags.isMiscEnabled = sp.getBoolean("isMiscEnabled", false);
+        FeatureFlags.disableStoryFlipping = sp.getBoolean("disableStoryFlipping", false);
+        FeatureFlags.disableVideoAutoPlay = sp.getBoolean("disableVideoAutoPlay", false);
+        FeatureFlags.disableRepost = sp.getBoolean("disableRepost", false);
+        FeatureFlags.enableMediaDownload = sp.getBoolean("enableMediaDownload", false);
+        FeatureFlags.showFollowerToast = sp.getBoolean("showFollowerToast", false);
+        FeatureFlags.showFeatureToasts = sp.getBoolean("showFeatureToasts", false);
 
         FeatureManager.refreshFeatureStatus();
     }

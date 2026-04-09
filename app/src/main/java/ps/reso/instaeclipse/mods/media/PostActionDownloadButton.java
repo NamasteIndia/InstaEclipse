@@ -13,8 +13,6 @@ import android.widget.LinearLayout;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
-import ps.reso.instaeclipse.utils.core.SettingsManager;
-import ps.reso.instaeclipse.utils.feature.FeatureFlags;
 import ps.reso.instaeclipse.utils.media.MediaDownloadManager;
 
 public class PostActionDownloadButton {
@@ -30,8 +28,6 @@ public class PostActionDownloadButton {
             XposedHelpers.findAndHookMethod(View.class, "onAttachedToWindow", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    if (!FeatureFlags.enableMediaDownload) return;
-
                     View view = (View) param.thisObject;
                     Context ctx = view.getContext();
                     if (ctx == null) return;
@@ -61,8 +57,6 @@ public class PostActionDownloadButton {
 
     public static void scanAndInject(Activity activity) {
         if (activity == null) return;
-        SettingsManager.loadAllFlags(activity);
-        if (!FeatureFlags.enableMediaDownload) return;
         PostActionDownloadButton helper = new PostActionDownloadButton();
         helper.ensureKnownIds(activity);
         helper.injectKnownContainers(activity);
